@@ -921,6 +921,36 @@ const electronAPI = {
     },
   },
 
+  // Skill Gateway v2 (M2: source CRUD only; more added in later milestones)
+  skills: {
+    sources: {
+      list: (): Promise<import('@shared/types').SkillSource[]> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_LIST),
+      add: (
+        req: import('@shared/types').AddSkillSourceRequest
+      ): Promise<import('@shared/types').SkillSource> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_ADD, req),
+      remove: (id: string): Promise<void> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE, id),
+      setEnabled: (id: string, enabled: boolean): Promise<void> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_SET_ENABLED, id, enabled),
+      update: (
+        id: string,
+        patch: Partial<
+          Pick<import('@shared/types').SkillSource, 'name' | 'branch' | 'sourceDir' | 'localPath'>
+        >
+      ): Promise<import('@shared/types').SkillSource> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_UPDATE, id, patch),
+      onChanged: (
+        callback: (sources: import('@shared/types').SkillSource[]) => void
+      ): (() => void) => {
+        const handler = (_: unknown, data: Parameters<typeof callback>[0]) => callback(data);
+        ipcRenderer.on(IPC_CHANNELS.SKILLS_SOURCES_CHANGED, handler);
+        return () => ipcRenderer.off(IPC_CHANNELS.SKILLS_SOURCES_CHANGED, handler);
+      },
+    },
+  },
+
   // Search
   search: {
     files: (params: FileSearchParams): Promise<FileSearchResult[]> =>

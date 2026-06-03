@@ -232,6 +232,14 @@ export const IPC_CHANNELS = {
   CLAUDE_PLUGINS_MARKETPLACES_REMOVE: 'claude:plugins:marketplaces:remove',
   CLAUDE_PLUGINS_MARKETPLACES_REFRESH: 'claude:plugins:marketplaces:refresh',
 
+  // Skill Gateway v2 — Sources (CRUD only in M2; browse/install added later)
+  SKILLS_SOURCES_LIST: 'skills:sources:list',
+  SKILLS_SOURCES_ADD: 'skills:sources:add',
+  SKILLS_SOURCES_REMOVE: 'skills:sources:remove',
+  SKILLS_SOURCES_SET_ENABLED: 'skills:sources:setEnabled',
+  SKILLS_SOURCES_UPDATE: 'skills:sources:update',
+  SKILLS_SOURCES_CHANGED: 'skills:sources:changed',
+
   // Search
   SEARCH_FILES: 'search:files',
   SEARCH_CONTENT: 'search:content',

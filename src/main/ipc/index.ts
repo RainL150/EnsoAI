@@ -30,6 +30,7 @@ import { registerNotificationHandlers } from './notification';
 import { registerSearchHandlers } from './search';
 import { registerSettingsHandlers } from './settings';
 import { registerShellHandlers } from './shell';
+import { registerSkillsHandlers, stopSkillsManager } from './skills';
 import { registerTempWorkspaceHandlers } from './tempWorkspace';
 import {
   destroyAllTerminals,
@@ -61,6 +62,7 @@ export function registerIpcHandlers(): void {
   registerClaudeProviderHandlers();
   registerClaudeConfigHandlers();
   registerClaudeCompletionsHandlers();
+  registerSkillsHandlers();
   registerWebInspectorHandlers();
   registerTempWorkspaceHandlers();
   registerTmuxHandlers();
@@ -104,6 +106,8 @@ export async function cleanupAllResources(): Promise<void> {
       safeRun(() => stopAllFileWatchers(), 'fileWatchers'),
       // Claude completions file watcher
       safeRun(() => stopClaudeCompletionsWatchers(), 'claudeCompletions'),
+      // Skill Gateway v2 — no-op in M2, full disposal in M5
+      safeRun(() => stopSkillsManager(), 'skillsManager'),
       // Temp files
       safeRun(() => cleanupTempFiles(), 'tempFiles'),
     ]),
