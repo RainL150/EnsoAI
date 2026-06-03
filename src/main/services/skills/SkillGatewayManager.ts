@@ -18,7 +18,8 @@ import {
   installToTarget,
   uninstallFromTarget,
 } from './SkillInstaller';
-import { readLock, writeLock } from './SkillLockStore';
+import { ensureLayout, readLock, writeLock } from './SkillLockStore';
+import { migrateV1IfNeeded } from './SkillMigration';
 import { scanSource } from './SkillRepository';
 import { WriteQueue } from './writeQueue';
 
@@ -48,6 +49,32 @@ export class SkillGatewayManager {
   subscribeUpdates(listener: UpdatesListener): () => void {
     this.updateListeners.add(listener);
     return () => this.updateListeners.delete(listener);
+  }
+
+  /**
+   * One-shot startup hook. Ensures the on-disk layout exists and runs the
+   * v1→v2 migration if a legacy `_index.json` is present. Safe to call
+   * multiple times; the migration self-guards on idempotency.
+   */
+  async init(): Promise<void> {
+    await ensureLayout();
+    try {
+      const result = await migrateV1IfNeeded();
+      if (result.migrated) {
+        console.log(
+          '[SkillGateway] v1→v2 migration done:',
+          `${result.sourcesCreated} sources, ${result.skillsCreated} skills,`,
+          `${result.warnings.length} warnings`
+        );
+        if (result.warnings.length > 0) {
+          for (const w of result.warnings) console.warn('[SkillGateway] migration warning:', w);
+        }
+        const lock = await readLock();
+        this.notify(lock.skills);
+      }
+    } catch (err) {
+      console.warn('[SkillGateway] migration failed:', err);
+    }
   }
 
   async dispose(): Promise<void> {

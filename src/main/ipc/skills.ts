@@ -31,6 +31,9 @@ export function registerSkillsHandlers(): void {
   gateway.subscribe((skills) => broadcast(IPC_CHANNELS.SKILLS_CHANGED, skills));
   gateway.subscribeUpdates((updates) => broadcast(IPC_CHANNELS.SKILLS_UPDATES_AVAILABLE, updates));
 
+  // Fire-and-forget init: layout creation + v1→v2 migration.
+  gateway.init().catch((err) => console.warn('[SkillGateway] init failed:', err));
+
   // ----- Sources -----
 
   ipcMain.handle(
