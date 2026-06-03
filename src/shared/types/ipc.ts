@@ -240,6 +240,20 @@ export const IPC_CHANNELS = {
   SKILLS_SOURCES_UPDATE: 'skills:sources:update',
   SKILLS_SOURCES_CHANGED: 'skills:sources:changed',
 
+  // Skill Gateway v2 — Skills (installed) ops
+  SKILLS_LIST: 'skills:list',
+  SKILLS_BROWSE: 'skills:browse',
+  SKILLS_INSTALL: 'skills:install',
+  SKILLS_UNINSTALL: 'skills:uninstall',
+  SKILLS_SYNC: 'skills:sync',
+  SKILLS_SET_ENABLED: 'skills:setEnabled',
+  SKILLS_SET_TARGETS: 'skills:setTargets',
+  SKILLS_OPEN_FOLDER: 'skills:openFolder',
+  SKILLS_CHECK_STATUS: 'skills:checkStatus',
+  SKILLS_CHECK_UPDATES: 'skills:checkUpdates',
+  SKILLS_CHANGED: 'skills:changed',
+  SKILLS_UPDATES_AVAILABLE: 'skills:updatesAvailable',
+
   // Search
   SEARCH_FILES: 'search:files',
   SEARCH_CONTENT: 'search:content',

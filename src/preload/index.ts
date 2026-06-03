@@ -949,6 +949,51 @@ const electronAPI = {
         return () => ipcRenderer.off(IPC_CHANNELS.SKILLS_SOURCES_CHANGED, handler);
       },
     },
+    list: (): Promise<import('@shared/types').InstalledSkill[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_LIST),
+    browse: (sourceId?: string): Promise<import('@shared/types').AvailableSkill[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_BROWSE, sourceId),
+    install: (
+      req: import('@shared/types').InstallSkillRequest
+    ): Promise<import('@shared/types').InstalledSkill> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_INSTALL, req),
+    uninstall: (
+      id: string,
+      options?: import('@shared/types').UninstallSkillOptions
+    ): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.SKILLS_UNINSTALL, id, options),
+    sync: (id: string): Promise<import('@shared/types').InstalledSkill> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SYNC, id),
+    setEnabled: (id: string, enabled: boolean): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SET_ENABLED, id, enabled),
+    setTargets: (
+      id: string,
+      targets: Partial<
+        Record<
+          import('@shared/types').SkillTarget,
+          { mode: import('@shared/types').SkillInstallMode }
+        >
+      >
+    ): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SET_TARGETS, id, targets),
+    openFolder: (id: string): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_OPEN_FOLDER, id),
+    checkStatus: (): Promise<import('@shared/types').InstalledSkill[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_CHECK_STATUS),
+    checkUpdates: (): Promise<import('@shared/types').UpdateAvailableInfo[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_CHECK_UPDATES),
+    onChanged: (
+      callback: (skills: import('@shared/types').InstalledSkill[]) => void
+    ): (() => void) => {
+      const handler = (_: unknown, data: Parameters<typeof callback>[0]) => callback(data);
+      ipcRenderer.on(IPC_CHANNELS.SKILLS_CHANGED, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.SKILLS_CHANGED, handler);
+    },
+    onUpdatesAvailable: (
+      callback: (updates: import('@shared/types').UpdateAvailableInfo[]) => void
+    ): (() => void) => {
+      const handler = (_: unknown, data: Parameters<typeof callback>[0]) => callback(data);
+      ipcRenderer.on(IPC_CHANNELS.SKILLS_UPDATES_AVAILABLE, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.SKILLS_UPDATES_AVAILABLE, handler);
+    },
   },
 
   // Search
