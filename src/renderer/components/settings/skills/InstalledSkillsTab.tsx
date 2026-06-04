@@ -39,8 +39,23 @@ export function InstalledSkillsTab() {
   React.useEffect(() => {
     reload();
     const unsubscribe = window.electronAPI.skills.onChanged?.((next) => setSkills(next));
-    return unsubscribe;
-  }, [reload]);
+    const unsubUpdates = window.electronAPI.skills.onUpdatesAvailable?.((updates) => {
+      if (updates.length === 0) return;
+      const names = updates
+        .map((u) => u.name)
+        .slice(0, 3)
+        .join(', ');
+      toastManager.add({
+        type: 'info',
+        title: `${updates.length} ${t('skill update(s) available')}`,
+        description: names + (updates.length > 3 ? ` +${updates.length - 3}` : ''),
+      });
+    });
+    return () => {
+      unsubscribe?.();
+      unsubUpdates?.();
+    };
+  }, [reload, t]);
 
   const handleToggleEnabled = async (id: string, enabled: boolean) => {
     setSkills((prev) => prev.map((s) => (s.id === id ? { ...s, enabled } : s)));

@@ -21,6 +21,7 @@ import {
 import { ensureLayout, readLock, writeLock } from './SkillLockStore';
 import { migrateV1IfNeeded } from './SkillMigration';
 import { scanSource } from './SkillRepository';
+import { SkillScheduler } from './SkillScheduler';
 import { WriteQueue } from './writeQueue';
 
 type SkillsListener = (skills: InstalledSkill[]) => void;
@@ -40,6 +41,7 @@ export class SkillGatewayManager {
   private skillsListeners = new Set<SkillsListener>();
   private updateListeners = new Set<UpdatesListener>();
   private writeQueue = new WriteQueue();
+  private scheduler: SkillScheduler | null = null;
 
   subscribe(listener: SkillsListener): () => void {
     this.skillsListeners.add(listener);
@@ -75,9 +77,26 @@ export class SkillGatewayManager {
     } catch (err) {
       console.warn('[SkillGateway] migration failed:', err);
     }
+
+    // Refresh per-target status so the UI shows the actual state from boot.
+    this.checkAllStatuses().catch((err) => {
+      console.warn('[SkillGateway] initial status check failed:', err);
+    });
+
+    // Start the 8h background refresh loop (only checks git sources).
+    if (!this.scheduler) {
+      this.scheduler = new SkillScheduler({
+        onTick: async () => {
+          await this.checkForUpdates();
+        },
+      });
+      this.scheduler.start();
+    }
   }
 
   async dispose(): Promise<void> {
+    this.scheduler?.stop();
+    this.scheduler = null;
     this.skillsListeners.clear();
     this.updateListeners.clear();
   }
