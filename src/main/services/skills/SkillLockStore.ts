@@ -18,6 +18,14 @@ export function getSourcesCacheRoot(): string {
   return path.join(getEnsoaiRoot(), 'sources');
 }
 
+/**
+ * Root for content promoted from real-dir native skills (M10).
+ * Each promoted skill gets a subdir keyed by its new local source id.
+ */
+export function getCanonicalContentRoot(): string {
+  return path.join(getEnsoaiRoot(), 'canonical');
+}
+
 /** Backups of overwritten mirror entries, timestamped. */
 export function getBackupsRoot(): string {
   return path.join(getEnsoaiRoot(), 'backups');
@@ -36,10 +44,12 @@ function emptyLock(): SkillLockFile {
   return { version: 2, sources: [], skills: [] };
 }
 
-/** Ensure ~/.ensoai/ and ~/.ensoai/sources/ exist. */
+/** Ensure ~/.ensoai/, sources/, canonical/, backups/ exist. */
 export async function ensureLayout(): Promise<void> {
   await fs.promises.mkdir(getEnsoaiRoot(), { recursive: true });
   await fs.promises.mkdir(getSourcesCacheRoot(), { recursive: true });
+  await fs.promises.mkdir(getCanonicalContentRoot(), { recursive: true });
+  await fs.promises.mkdir(getBackupsRoot(), { recursive: true });
 }
 
 /**

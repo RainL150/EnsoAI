@@ -2,7 +2,14 @@
 // Does NOT do git fetch / repo scanning — that lives in M3's SkillRepository.
 
 import type { AddSkillSourceRequest, SkillSource } from '@shared/types';
+import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { generateSourceId, readLock, writeLock } from './SkillLockStore';
+
+const NATIVE_SOURCE_IDS = new Set([CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID]);
+
+function isNativeSource(source: SkillSource): boolean {
+  return source.type === 'native' || NATIVE_SOURCE_IDS.has(source.id);
+}
 
 type ChangeListener = (sources: SkillSource[]) => void;
 
@@ -72,6 +79,10 @@ export class SkillSourceManager {
     const idx = lock.sources.findIndex((s) => s.id === id);
     if (idx === -1) return;
 
+    if (isNativeSource(lock.sources[idx])) {
+      throw makeError('EBUSY_SOURCE', '内置 native 来源不可删除');
+    }
+
     // Refuse if any installed skill still references this source — caller must
     // uninstall those first. Cascade-uninstall is the SkillGatewayManager's
     // concern (M5); SourceManager stays focused on lock data integrity.
@@ -110,6 +121,14 @@ export class SkillSourceManager {
     const lock = await readLock();
     const source = lock.sources.find((s) => s.id === id);
     if (!source) throw makeError('ENOENT_SOURCE', `Source ${id} not found`);
+    if (isNativeSource(source)) {
+      // Only name is editable on native sources; path / branch / type are fixed.
+      if (patch.name !== undefined) source.name = patch.name;
+      source.updatedAt = new Date().toISOString();
+      await writeLock(lock);
+      this.notify(lock.sources);
+      return source;
+    }
     if (patch.name !== undefined) source.name = patch.name;
     if (patch.branch !== undefined && source.type === 'git') source.branch = patch.branch;
     if (patch.sourceDir !== undefined && source.type === 'git') source.sourceDir = patch.sourceDir;
@@ -147,6 +166,9 @@ export class SkillSourceManager {
 
   private validateAddRequest(req: AddSkillSourceRequest): void {
     if (!req.name?.trim()) throw makeError('EINVAL', 'name is required');
+    if ((req.type as string) === 'native') {
+      throw makeError('EINVAL', '不能手动添加 native 类型来源（系统内置）');
+    }
     if (req.type === 'git') {
       if (!req.repoUrl?.trim()) throw makeError('EINVAL', 'repoUrl is required for git source');
       if (!/^(https?:\/\/|git@)/i.test(req.repoUrl)) {

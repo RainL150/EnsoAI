@@ -15,8 +15,10 @@ import type {
   SkillSource,
   SkillTarget,
   UninstallSkillOptions,
+  UnpromoteRequest,
   UpdateAvailableInfo,
 } from '@shared/types';
+import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { shell } from 'electron';
 import { copyDir, linkOrCopy, readlinkAbsolute, unlinkSafe } from './linker';
 import { getProvider } from './providers';
@@ -27,7 +29,13 @@ import {
   installToTarget,
   uninstallFromTarget,
 } from './SkillInstaller';
-import { ensureLayout, generateSourceId, readLock, writeLock } from './SkillLockStore';
+import {
+  ensureLayout,
+  generateSourceId,
+  getCanonicalContentRoot,
+  readLock,
+  writeLock,
+} from './SkillLockStore';
 import { migrateV1IfNeeded } from './SkillMigration';
 import { scanSource } from './SkillRepository';
 import { SkillScheduler } from './SkillScheduler';
@@ -69,6 +77,7 @@ export class SkillGatewayManager {
    */
   async init(): Promise<void> {
     await ensureLayout();
+    await this.ensureNativeSources();
     try {
       const result = await migrateV1IfNeeded();
       if (result.migrated) {
@@ -110,6 +119,36 @@ export class SkillGatewayManager {
     this.updateListeners.clear();
   }
 
+  /**
+   * Ensure the two built-in native sources exist in the lock. Idempotent.
+   * Native sources surface what's already at the provider dirs without
+   * requiring user configuration.
+   */
+  private async ensureNativeSources(): Promise<void> {
+    const lock = await readLock();
+    let mutated = false;
+    const seed = (id: string, name: string, target: SkillTarget) => {
+      if (lock.sources.find((s) => s.id === id)) return;
+      const now = new Date().toISOString();
+      lock.sources.push({
+        id,
+        type: 'native',
+        name,
+        nativeTarget: target,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      mutated = true;
+    };
+    seed(CLAUDE_NATIVE_SOURCE_ID, 'Claude 本地', 'claude');
+    seed(CODEX_NATIVE_SOURCE_ID, 'Codex 本地', 'codex');
+    if (mutated) {
+      await writeLock(lock);
+      this.notify(lock.skills);
+    }
+  }
+
   // ---------- Read ops (no queue needed) ----------
 
   async listInstalled(): Promise<InstalledSkill[]> {
@@ -133,7 +172,20 @@ export class SkillGatewayManager {
       try {
         const result = await scanSource(source);
         for (const s of result.skills) {
-          out.push({ ...s, installed: installedKeys.has(composeSkillId(source.id, s.name)) });
+          const augmented: AvailableSkill = {
+            ...s,
+            installed: installedKeys.has(composeSkillId(source.id, s.name)),
+          };
+          // For native sources, annotate "taken over by" when a lock skill has
+          // promoted this provider entry.
+          if (source.type === 'native' && source.nativeTarget) {
+            const providerPath = path.join(getProvider(source.nativeTarget).getSkillsDir(), s.name);
+            const promoted = lock.skills.find(
+              (ls) => ls.targets[source.nativeTarget!]?.path === providerPath
+            );
+            if (promoted) augmented.takenOverBySourceId = promoted.sourceId;
+          }
+          out.push(augmented);
         }
       } catch (err) {
         console.warn('[SkillGateway] browse failed for source', source.id, err);
@@ -443,11 +495,17 @@ export class SkillGatewayManager {
 
   /**
    * Adopt a native discovered skill into gateway management.
-   * - symlink-external: register source pointing at the symlink target (dev dir);
-   *   re-install the original symlink (which is idempotent since the link already
-   *   points there).
-   * - real-dir: register source pointing at the provider path itself.
-   *   SkillInstaller detects the in-place case (contentPath === dst) and no-ops.
+   *
+   * - symlink-external: zero file movement. canonical = the dev dir (the
+   *   symlink's existing target). The provider symlink already points there
+   *   so we don't touch the FS.
+   * - real-dir: move the provider directory into ~/.ensoai/canonical/<newId>/
+   *   and replace the provider path with a symlink → canonical. User's
+   *   content is preserved (now in canonical) and ~/.claude/skills/<name>
+   *   becomes a gateway-managed symlink.
+   *
+   * Both flavors create a new type='local' SkillSource that owns the skill.
+   * The original native source loses this entry on the next browse scan.
    */
   async promoteDiscovered(req: PromoteDiscoveredRequest): Promise<InstalledSkill> {
     return this.writeQueue.run(async () => {
@@ -460,11 +518,6 @@ export class SkillGatewayManager {
       }
 
       const lock = await readLock();
-      const localPath = item.symlinkTarget ?? item.contentPath;
-
-      if (lock.sources.find((s) => s.type === 'local' && s.localPath === localPath)) {
-        throw makeError('EEXIST_SOURCE', `A local source for ${localPath} already exists`);
-      }
       if (lock.skills.find((s) => s.name === req.name && req.origin in s.targets)) {
         throw makeError(
           'EEXIST_INSTALLED',
@@ -472,13 +525,54 @@ export class SkillGatewayManager {
         );
       }
 
+      const provider = getProvider(req.origin);
+      const providerPath = path.join(provider.getSkillsDir(), req.name);
       const now = new Date().toISOString();
       const sourceId = generateSourceId();
+
+      let canonicalPath: string;
+
+      if (item.kind === 'symlink-external') {
+        if (!item.symlinkTarget) {
+          throw makeError(
+            'EINVAL',
+            `discovered ${req.name}: symlink-external missing symlinkTarget`
+          );
+        }
+        canonicalPath = item.symlinkTarget;
+        // Refuse if another source already owns this dev dir
+        if (lock.sources.find((s) => s.type === 'local' && s.localPath === canonicalPath)) {
+          throw makeError('EEXIST_SOURCE', `A local source for ${canonicalPath} already exists`);
+        }
+        // No FS work — provider path symlink already points at canonical (dev dir)
+      } else {
+        // real-dir: move content into ~/.ensoai/canonical/<sourceId>/<name>/
+        await ensureLayout();
+        const canonicalSourceDir = path.join(getCanonicalContentRoot(), sourceId);
+        await fs.promises.mkdir(canonicalSourceDir, { recursive: true });
+        canonicalPath = path.join(canonicalSourceDir, req.name);
+
+        try {
+          await fs.promises.rename(providerPath, canonicalPath);
+        } catch (err) {
+          // Cross-device fallback (rare on macOS but possible with external drives).
+          if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+            await fs.promises.cp(providerPath, canonicalPath, { recursive: true });
+            await fs.promises.rm(providerPath, { recursive: true, force: true });
+          } else {
+            throw err;
+          }
+        }
+
+        // Recreate provider path as a symlink pointing at canonical
+        await fs.promises.symlink(canonicalPath, providerPath, 'dir');
+      }
+
       const source: SkillSource = {
         id: sourceId,
         type: 'local',
         name: req.name,
-        localPath,
+        localPath: canonicalPath,
         enabled: true,
         createdAt: now,
         updatedAt: now,
@@ -490,27 +584,122 @@ export class SkillGatewayManager {
         sourceId,
         name: req.name,
         description: item.description,
-        contentPath: localPath,
+        contentPath: canonicalPath,
         contentHash: item.contentHash,
-        targets: {},
+        targets: {
+          [req.origin]: {
+            mode: 'symlink',
+            path: providerPath,
+            status: 'managed',
+            installedAt: now,
+          },
+        },
         enabled: true,
         installedAt: now,
         updatedAt: now,
       };
-
-      // Install at origin target. For symlink-external this rewrites the existing
-      // symlink to point at the dev dir (same as before — idempotent). For real-dir
-      // this is the in-place case → SkillInstaller no-ops.
-      const targetState = await installToTarget(skill, req.origin, {
-        mode: 'symlink',
-        backupExisting: true,
-      });
-      skill.targets[req.origin] = targetState;
       lock.skills.push(skill);
 
       await writeLock(lock);
       this.notify(lock.skills);
       return skill;
+    });
+  }
+
+  /**
+   * Reverse a promote operation. Two modes:
+   *
+   * - 'restore-to-native':
+   *     symlink-external → no FS change; just drop lock + source.
+   *     real-dir → move canonical content back to the provider path, replace
+   *     the gateway symlink with the restored real dir, then drop canonical +
+   *     lock + source.
+   *
+   * - 'delete-both':
+   *     trash the provider entry (symlink or restored dir),
+   *     trash the canonical dir if it lives under ~/.ensoai/canonical (i.e.,
+   *     this was a real-dir promote — symlink-external dev dirs are NEVER
+   *     touched here), drop lock + source.
+   */
+  async unpromote(req: UnpromoteRequest): Promise<void> {
+    return this.writeQueue.run(async () => {
+      const lock = await readLock();
+      const skillIdx = lock.skills.findIndex((s) => s.id === req.skillId);
+      if (skillIdx === -1) throw makeError('ENOENT_SKILL', `Skill ${req.skillId} not found`);
+      const skill = lock.skills[skillIdx];
+      const source = lock.sources.find((s) => s.id === skill.sourceId);
+
+      const targets = Object.keys(skill.targets) as SkillTarget[];
+      if (targets.length === 0) throw makeError('EINVAL', `skill ${req.skillId} has no targets`);
+      // Promoted skills always have exactly one target (the origin native).
+      const target = targets[0];
+      const providerPath = skill.targets[target]?.path;
+      if (!providerPath) throw makeError('EINVAL', `target ${target} missing path`);
+
+      const canonicalRoot = path.resolve(getCanonicalContentRoot());
+      const isRealDirPromoted = path
+        .resolve(skill.contentPath)
+        .startsWith(canonicalRoot + path.sep);
+
+      if (req.mode === 'restore-to-native') {
+        if (isRealDirPromoted) {
+          // Move canonical back to provider path, then clean canonical dir.
+          await unlinkSafe(providerPath);
+          try {
+            await fs.promises.rename(skill.contentPath, providerPath);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+              await fs.promises.cp(skill.contentPath, providerPath, { recursive: true });
+              await fs.promises.rm(skill.contentPath, { recursive: true, force: true });
+            } else {
+              throw err;
+            }
+          }
+          // Drop the now-empty <canonical>/<sourceId>/ wrapper dir.
+          const canonicalSourceDir = path.dirname(skill.contentPath);
+          await fs.promises
+            .rm(canonicalSourceDir, { recursive: true, force: true })
+            .catch(() => {});
+        }
+        // symlink-external: provider path is already a symlink to dev dir.
+        // No FS work needed — leaving lock removal as the only effect.
+      } else if (req.mode === 'delete-both') {
+        const useTrash = req.moveToTrash !== false;
+        try {
+          if (useTrash) {
+            await shell.trashItem(providerPath);
+          } else {
+            await fs.promises.rm(providerPath, { recursive: true, force: true });
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        }
+        if (isRealDirPromoted) {
+          const canonicalSourceDir = path.dirname(skill.contentPath);
+          try {
+            if (useTrash) {
+              await shell.trashItem(canonicalSourceDir);
+            } else {
+              await fs.promises.rm(canonicalSourceDir, { recursive: true, force: true });
+            }
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          }
+        }
+        // For symlink-external: dev dir (skill.contentPath) is NEVER touched.
+      } else {
+        throw makeError('EINVAL', `unknown unpromote mode: ${(req as { mode: string }).mode}`);
+      }
+
+      // Remove lock + the auto-created local source
+      lock.skills.splice(skillIdx, 1);
+      if (source && source.type === 'local') {
+        const sourceIdx = lock.sources.findIndex((s) => s.id === source.id);
+        if (sourceIdx !== -1) lock.sources.splice(sourceIdx, 1);
+      }
+
+      await writeLock(lock);
+      this.notify(lock.skills);
     });
   }
 

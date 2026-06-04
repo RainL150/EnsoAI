@@ -1,10 +1,11 @@
 import type {
   DiscoveredSkill,
   InstalledSkill,
+  SkillSource,
   SkillTarget,
   SkillTargetStatus,
 } from '@shared/types';
-import { Check, FolderOpen, Loader2, RefreshCw, Trash2, Wand2, X } from 'lucide-react';
+import { Check, FolderOpen, History, Loader2, RefreshCw, Trash2, Wand2, X } from 'lucide-react';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -13,6 +14,9 @@ import { useI18n } from '@/i18n';
 import { cn } from '@/lib/utils';
 import { DeleteNativeDialog } from './DeleteNativeDialog';
 import { NativeSkillCard } from './NativeSkillCard';
+import { UnpromoteDialog } from './UnpromoteDialog';
+
+type FilterTarget = 'all' | SkillTarget;
 
 const ALL_TARGETS: SkillTarget[] = ['claude', 'codex'];
 const TARGET_LABELS: Record<SkillTarget, string> = { claude: 'Claude', codex: 'Codex' };
@@ -28,19 +32,24 @@ export function InstalledSkillsTab() {
   const { t } = useI18n();
   const [skills, setSkills] = React.useState<InstalledSkill[]>([]);
   const [discovered, setDiscovered] = React.useState<DiscoveredSkill[]>([]);
+  const [sources, setSources] = React.useState<SkillSource[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [syncingId, setSyncingId] = React.useState<string | null>(null);
   const [uninstallingId, setUninstallingId] = React.useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<DiscoveredSkill | null>(null);
+  const [unpromoteTarget, setUnpromoteTarget] = React.useState<InstalledSkill | null>(null);
+  const [filter, setFilter] = React.useState<FilterTarget>('all');
 
   const reload = React.useCallback(async () => {
     try {
-      const [managed, native] = await Promise.all([
+      const [managed, native, sourceList] = await Promise.all([
         window.electronAPI.skills.list(),
         window.electronAPI.skills.listDiscovered(),
+        window.electronAPI.skills.sources.list(),
       ]);
       setSkills(managed);
       setDiscovered(native);
+      setSources(sourceList);
     } catch (err) {
       console.error('[InstalledSkillsTab] load failed:', err);
       toastManager.add({ type: 'error', title: t('Failed to load skills') });
@@ -48,6 +57,18 @@ export function InstalledSkillsTab() {
       setLoading(false);
     }
   }, [t]);
+
+  // A "promoted" skill is one whose source is a local source auto-created by
+  // promoteDiscovered. Heuristic: source.type==='local' and the skill has
+  // exactly one target — exactly how promoteDiscovered builds them.
+  const isPromoted = React.useCallback(
+    (skill: InstalledSkill): boolean => {
+      const source = sources.find((s) => s.id === skill.sourceId);
+      if (!source || source.type !== 'local') return false;
+      return Object.keys(skill.targets).length === 1;
+    },
+    [sources]
+  );
 
   React.useEffect(() => {
     reload();
@@ -154,10 +175,54 @@ export function InstalledSkillsTab() {
     );
   }
 
+  const visibleDiscovered =
+    filter === 'all' ? discovered : discovered.filter((d) => d.target === filter);
+  const visibleSkills = filter === 'all' ? skills : skills.filter((s) => filter in s.targets);
+
+  const filterTabs: Array<{ id: FilterTarget; label: string; count: number }> = [
+    { id: 'all', label: t('全部'), count: skills.length + discovered.length },
+    {
+      id: 'claude',
+      label: 'Claude',
+      count:
+        skills.filter((s) => 'claude' in s.targets).length +
+        discovered.filter((d) => d.target === 'claude').length,
+    },
+    {
+      id: 'codex',
+      label: 'Codex',
+      count:
+        skills.filter((s) => 'codex' in s.targets).length +
+        discovered.filter((d) => d.target === 'codex').length,
+    },
+  ];
+
   return (
     <>
+      <div className="flex items-center gap-1 mb-3 border-b">
+        {filterTabs.map((ft) => {
+          const active = filter === ft.id;
+          return (
+            <button
+              type="button"
+              key={ft.id}
+              onClick={() => setFilter(ft.id)}
+              className={cn(
+                'px-3 py-1.5 text-xs border-b-2 -mb-px transition-colors',
+                active
+                  ? 'border-foreground text-foreground'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              )}
+            >
+              {ft.label}
+              <span className="ml-1 opacity-60">{ft.count}</span>
+            </button>
+          );
+        })}
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 pb-2">
-        {discovered.map((d) => (
+        {visibleDiscovered.map((d) => (
           <NativeSkillCard
             key={`native::${d.target}::${d.name}`}
             skill={d}
@@ -165,7 +230,7 @@ export function InstalledSkillsTab() {
             onChanged={reload}
           />
         ))}
-        {skills.map((skill) => (
+        {visibleSkills.map((skill) => (
           <div
             key={skill.id}
             className="flex flex-col gap-3 rounded-lg border bg-card p-4 hover:bg-accent/30 transition-colors"
@@ -236,20 +301,32 @@ export function InstalledSkillsTab() {
                 {t('Open folder')}
               </Button>
               <div className="flex-1" />
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="text-destructive hover:text-destructive"
-                onClick={() => handleUninstall(skill.id)}
-                disabled={uninstallingId === skill.id}
-                title={t('Uninstall')}
-              >
-                {uninstallingId === skill.id ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Trash2 className="h-3.5 w-3.5" />
-                )}
-              </Button>
+              {isPromoted(skill) ? (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="text-muted-foreground hover:text-foreground"
+                  onClick={() => setUnpromoteTarget(skill)}
+                  title={t('取消接管')}
+                >
+                  <History className="h-3.5 w-3.5" />
+                </Button>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => handleUninstall(skill.id)}
+                  disabled={uninstallingId === skill.id}
+                  title={t('Uninstall')}
+                >
+                  {uninstallingId === skill.id ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              )}
             </div>
           </div>
         ))}
@@ -261,6 +338,14 @@ export function InstalledSkillsTab() {
           if (!v) setDeleteTarget(null);
         }}
         onDeleted={reload}
+      />
+      <UnpromoteDialog
+        skill={unpromoteTarget}
+        open={unpromoteTarget !== null}
+        onOpenChange={(v) => {
+          if (!v) setUnpromoteTarget(null);
+        }}
+        onUnpromoted={reload}
       />
     </>
   );

@@ -8,9 +8,13 @@
 // status so we can detect: managed / modified / missing / wrong-symlink.
 
 export type SkillTarget = 'claude' | 'codex';
-export type SkillSourceType = 'git' | 'local';
+export type SkillSourceType = 'git' | 'local' | 'native';
 export type SkillInstallMode = 'symlink' | 'copy';
 export type SkillTargetStatus = 'managed' | 'modified' | 'missing' | 'wrong-symlink';
+
+/** Sentinel ids for the auto-managed native sources (M10). */
+export const CLAUDE_NATIVE_SOURCE_ID = 'claude-native';
+export const CODEX_NATIVE_SOURCE_ID = 'codex-native';
 
 export interface SkillSource {
   /** Stable generated id, e.g. `src_<uuid>`. */
@@ -30,6 +34,10 @@ export interface SkillSource {
   // Local-type source
   /** Required when type='local'. Absolute path to a directory containing SKILL.md or skill subdirs. */
   localPath?: string;
+
+  // Native-type source (M10)
+  /** Required when type='native'. Which provider this source surfaces. */
+  nativeTarget?: SkillTarget;
 
   enabled: boolean;
   lastRefreshAt?: string;
@@ -61,6 +69,19 @@ export interface AvailableSkill {
   /** SHA256 of skill directory content; drives update detection. */
   contentHash: string;
   installed: boolean;
+  /**
+   * For type='native' sources only: when set, the skill has been promoted to
+   * a user-managed local source with this id (the entry no longer "belongs" to
+   * native — UI should show "已接管" badge and route actions through that source).
+   */
+  takenOverBySourceId?: string;
+  /**
+   * For type='native' sources only: 'symlink-external' or 'real-dir'.
+   * Drives the kind-aware promote dialog.
+   */
+  nativeKind?: 'symlink-external' | 'real-dir';
+  /** Only present when nativeKind='symlink-external'. */
+  nativeSymlinkTarget?: string;
 }
 
 export interface SkillTargetState {
@@ -171,4 +192,20 @@ export interface DeleteNativeOptions {
   moveToTrash: boolean;
   /** Default true — also clean up gateway mirrors pointing at the deleted path. */
   alsoRemoveMirrors: boolean;
+}
+
+/**
+ * Two unmanage flavors (M10):
+ *   - 'restore-to-native': revert to the original native-discovered state.
+ *       For symlink-external: no FS change (the original symlink already points
+ *       at the dev dir). For real-dir: move canonical content back to the
+ *       provider path, restoring the real folder.
+ *   - 'delete-both': trash the provider entry AND delete canonical. For
+ *       symlink-external, the dev dir is NEVER touched.
+ */
+export interface UnpromoteRequest {
+  skillId: string;
+  mode: 'restore-to-native' | 'delete-both';
+  /** Only honored when mode='delete-both'. Default true. */
+  moveToTrash?: boolean;
 }

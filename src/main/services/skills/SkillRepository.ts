@@ -13,6 +13,8 @@ import * as path from 'node:path';
 import type { AvailableSkill, SkillSource } from '@shared/types';
 import { execInPty } from '../../utils/shell';
 import { parseSkillFrontMatter } from '../../utils/skillFrontmatter';
+import { readlinkAbsolute } from './linker';
+import { getProvider } from './providers';
 import { hashDir } from './SkillHash';
 import { ensureLayout, getSourcesCacheRoot } from './SkillLockStore';
 
@@ -157,10 +159,14 @@ async function readSkillMd(dir: string): Promise<string | null> {
 }
 
 /**
- * Refresh the source (fetch if git, no-op if local) and produce the list of
- * AvailableSkill it currently contains.
+ * Refresh the source (fetch if git, no-op if local/native) and produce the
+ * list of AvailableSkill it currently contains.
  */
 export async function scanSource(source: SkillSource): Promise<ScanResult> {
+  if (source.type === 'native') {
+    return scanNativeSource(source);
+  }
+
   const warnings: string[] = [];
 
   let scanRoot: string;
@@ -216,6 +222,105 @@ export async function scanSource(source: SkillSource): Promise<ScanResult> {
       contentPath: dir,
       contentHash,
       installed: false, // GatewayManager (M5) overlays the installed bit
+    });
+  }
+
+  return { skills, warnings };
+}
+
+/**
+ * Scan a type='native' source — i.e., list everything under the matching
+ * provider's skills dir, classify symlink-external vs real-dir, but do not
+ * recurse. The skill name is the directory name (not parsed frontmatter),
+ * because provider expectations require exact dir-name == skill-name.
+ *
+ * `takenOverBySourceId` is left undefined here; GatewayManager.browse fills it
+ * in by cross-referencing lock.skills[].targets[<nativeTarget>].path.
+ */
+async function scanNativeSource(source: SkillSource): Promise<ScanResult> {
+  const warnings: string[] = [];
+  if (!source.nativeTarget) {
+    return { skills: [], warnings: ['native source missing nativeTarget'] };
+  }
+  const provider = getProvider(source.nativeTarget);
+  const dir = provider.getSkillsDir();
+
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { skills: [], warnings: [] };
+    }
+    throw err;
+  }
+
+  const skills: AvailableSkill[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+    const fullPath = path.join(dir, entry.name);
+
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.lstat(fullPath);
+    } catch {
+      continue;
+    }
+
+    let kind: 'symlink-external' | 'real-dir';
+    let symlinkTarget: string | undefined;
+    let contentPath: string;
+
+    if (stat.isSymbolicLink()) {
+      const resolved = await readlinkAbsolute(fullPath);
+      if (!resolved) continue;
+      kind = 'symlink-external';
+      symlinkTarget = resolved;
+      contentPath = resolved;
+    } else if (stat.isDirectory()) {
+      kind = 'real-dir';
+      contentPath = fullPath;
+    } else {
+      continue;
+    }
+
+    // Must contain SKILL.md to count as a skill
+    let hasSkillMd = false;
+    try {
+      const children = await fs.promises.readdir(contentPath);
+      hasSkillMd = children.some((c) => c.toLowerCase() === 'skill.md');
+    } catch {
+      continue;
+    }
+    if (!hasSkillMd) continue;
+
+    let description: string | undefined;
+    let version: string | undefined;
+    const content = await readSkillMd(contentPath);
+    if (content) {
+      const meta = parseSkillFrontMatter(content);
+      description = meta?.description;
+      version = meta?.version;
+    }
+
+    let contentHash: string;
+    try {
+      contentHash = await hashDir(contentPath);
+    } catch (err) {
+      warnings.push(`skipped ${fullPath}: hash failed (${(err as Error).message})`);
+      continue;
+    }
+
+    skills.push({
+      sourceId: source.id,
+      name: entry.name,
+      description,
+      version,
+      contentPath,
+      contentHash,
+      installed: false,
+      nativeKind: kind,
+      nativeSymlinkTarget: symlinkTarget,
     });
   }
 

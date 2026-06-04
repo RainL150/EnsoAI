@@ -994,6 +994,8 @@ const electronAPI = {
       options: import('@shared/types').DeleteNativeOptions
     ): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.SKILLS_DELETE_NATIVE, target, name, options),
+    unpromote: (req: import('@shared/types').UnpromoteRequest): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_UNPROMOTE, req),
     onChanged: (
       callback: (skills: import('@shared/types').InstalledSkill[]) => void
     ): (() => void) => {

@@ -14,6 +14,7 @@ import {
   type SkillSource,
   type SkillTarget,
   type UninstallSkillOptions,
+  type UnpromoteRequest,
   type UpdateAvailableInfo,
 } from '@shared/types';
 import { BrowserWindow, ipcMain } from 'electron';
@@ -159,6 +160,13 @@ export function registerSkillsHandlers(): void {
       options: DeleteNativeOptions
     ): Promise<void> => {
       await gateway.deleteNative(target, name, options);
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_UNPROMOTE,
+    async (_event, req: UnpromoteRequest): Promise<void> => {
+      await gateway.unpromote(req);
     }
   );
 }
