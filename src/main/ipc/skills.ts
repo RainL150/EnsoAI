@@ -56,6 +56,13 @@ export function registerSkillsHandlers(): void {
   });
 
   ipcMain.handle(
+    IPC_CHANNELS.SKILLS_SOURCES_REMOVE_CASCADE,
+    async (_event, id: string): Promise<void> => {
+      await gateway.removeSourceCascade(id);
+    }
+  );
+
+  ipcMain.handle(
     IPC_CHANNELS.SKILLS_SOURCES_SET_ENABLED,
     async (_event, id: string, enabled: boolean): Promise<void> => {
       await sourceManager.setEnabled(id, enabled);

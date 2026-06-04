@@ -33,6 +33,7 @@ import {
   ensureLayout,
   generateSourceId,
   getCanonicalContentRoot,
+  getSourcesCacheRoot,
   readLock,
   writeLock,
 } from './SkillLockStore';
@@ -750,6 +751,56 @@ export class SkillGatewayManager {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
       this.notify((await readLock()).skills);
+    });
+  }
+
+  /**
+   * Cascade-remove a source plus every skill that references it.
+   * Cleans canonical content (for promoted local sources whose localPath sits
+   * under ~/.ensoai/canonical/) and the git clone cache (for git sources).
+   * Native sources are immutable — refuses.
+   */
+  async removeSourceCascade(sourceId: string): Promise<void> {
+    return this.writeQueue.run(async () => {
+      const lock = await readLock();
+      const source = lock.sources.find((s) => s.id === sourceId);
+      if (!source) return;
+      if (source.type === 'native') {
+        throw makeError('EREFUSED_NATIVE', 'Native sources cannot be removed');
+      }
+
+      // Drop mirrors for every dependent skill (must run before lock mutation
+      // so SkillInstaller can still resolve target paths from skill state).
+      const dependents = lock.skills.filter((s) => s.sourceId === sourceId);
+      for (const skill of dependents) {
+        for (const target of Object.keys(skill.targets) as SkillTarget[]) {
+          await uninstallFromTarget(target, skill.name);
+        }
+      }
+      lock.skills = lock.skills.filter((s) => s.sourceId !== sourceId);
+
+      // Clean source-owned on-disk content.
+      if (source.type === 'local' && source.localPath) {
+        const canonicalRoot = path.resolve(getCanonicalContentRoot());
+        const localPath = path.resolve(source.localPath);
+        if (localPath === canonicalRoot || localPath.startsWith(canonicalRoot + path.sep)) {
+          // Promoted real-dir layout: ~/.ensoai/canonical/<sourceId>/<name>
+          // Remove the parent dir so the per-source bucket goes away cleanly.
+          const canonicalSourceDir = path.dirname(localPath);
+          await fs.promises
+            .rm(canonicalSourceDir, { recursive: true, force: true })
+            .catch(() => {});
+        }
+        // External (dev-dir) localPath stays — user owns it.
+      }
+      if (source.type === 'git') {
+        const cloneDir = path.join(getSourcesCacheRoot(), sourceId);
+        await fs.promises.rm(cloneDir, { recursive: true, force: true }).catch(() => {});
+      }
+
+      lock.sources = lock.sources.filter((s) => s.id !== sourceId);
+      await writeLock(lock);
+      this.notify(lock.skills);
     });
   }
 

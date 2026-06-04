@@ -236,6 +236,7 @@ export const IPC_CHANNELS = {
   SKILLS_SOURCES_LIST: 'skills:sources:list',
   SKILLS_SOURCES_ADD: 'skills:sources:add',
   SKILLS_SOURCES_REMOVE: 'skills:sources:remove',
+  SKILLS_SOURCES_REMOVE_CASCADE: 'skills:sources:removeCascade',
   SKILLS_SOURCES_SET_ENABLED: 'skills:sources:setEnabled',
   SKILLS_SOURCES_UPDATE: 'skills:sources:update',
   SKILLS_SOURCES_CHANGED: 'skills:sources:changed',

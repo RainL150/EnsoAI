@@ -932,6 +932,8 @@ const electronAPI = {
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_ADD, req),
       remove: (id: string): Promise<void> =>
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE, id),
+      removeCascade: (id: string): Promise<void> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE_CASCADE, id),
       setEnabled: (id: string, enabled: boolean): Promise<void> =>
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_SET_ENABLED, id, enabled),
       update: (
