@@ -74,6 +74,19 @@ export async function installToTarget(
     };
   }
 
+  // In-place case: contentPath IS the target path (real-dir native skill that was
+  // promoted to a local source pointing at its own provider dir). Don't try to
+  // symlink/copy a path into itself — just record the state.
+  if (path.resolve(skill.contentPath) === path.resolve(dst)) {
+    return {
+      mode: options.mode,
+      path: dst,
+      status: 'managed',
+      installedAt: new Date().toISOString(),
+      installedHash: options.mode === 'copy' ? skill.contentHash : undefined,
+    };
+  }
+
   if (existing.kind !== 'missing' && options.backupExisting !== false) {
     await backupEntry(dst, skill.name);
   } else if (existing.kind !== 'missing') {

@@ -251,6 +251,10 @@ export const IPC_CHANNELS = {
   SKILLS_OPEN_FOLDER: 'skills:openFolder',
   SKILLS_CHECK_STATUS: 'skills:checkStatus',
   SKILLS_CHECK_UPDATES: 'skills:checkUpdates',
+  SKILLS_LIST_DISCOVERED: 'skills:listDiscovered',
+  SKILLS_MIRROR_DISCOVERED: 'skills:mirrorDiscovered',
+  SKILLS_PROMOTE_DISCOVERED: 'skills:promoteDiscovered',
+  SKILLS_DELETE_NATIVE: 'skills:deleteNative',
   SKILLS_CHANGED: 'skills:changed',
   SKILLS_UPDATES_AVAILABLE: 'skills:updatesAvailable',
 

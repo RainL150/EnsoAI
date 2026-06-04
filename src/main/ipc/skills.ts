@@ -3,9 +3,13 @@
 
 import {
   type AddSkillSourceRequest,
+  type DeleteNativeOptions,
+  type DiscoveredSkill,
   type InstalledSkill,
   type InstallSkillRequest,
   IPC_CHANNELS,
+  type MirrorDiscoveredRequest,
+  type PromoteDiscoveredRequest,
   type SkillInstallMode,
   type SkillSource,
   type SkillTarget,
@@ -124,6 +128,38 @@ export function registerSkillsHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.SKILLS_CHECK_UPDATES,
     async (): Promise<UpdateAvailableInfo[]> => gateway.checkForUpdates()
+  );
+
+  // ----- Native discovery / mirror / promote / delete -----
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_LIST_DISCOVERED,
+    async (): Promise<DiscoveredSkill[]> => gateway.listDiscovered()
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_MIRROR_DISCOVERED,
+    async (_event, req: MirrorDiscoveredRequest): Promise<void> => {
+      await gateway.mirrorDiscovered(req);
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_PROMOTE_DISCOVERED,
+    async (_event, req: PromoteDiscoveredRequest): Promise<InstalledSkill> =>
+      gateway.promoteDiscovered(req)
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_DELETE_NATIVE,
+    async (
+      _event,
+      target: SkillTarget,
+      name: string,
+      options: DeleteNativeOptions
+    ): Promise<void> => {
+      await gateway.deleteNative(target, name, options);
+    }
   );
 }
 

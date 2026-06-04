@@ -980,6 +980,20 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.SKILLS_CHECK_STATUS),
     checkUpdates: (): Promise<import('@shared/types').UpdateAvailableInfo[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.SKILLS_CHECK_UPDATES),
+    listDiscovered: (): Promise<import('@shared/types').DiscoveredSkill[]> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_LIST_DISCOVERED),
+    mirrorDiscovered: (req: import('@shared/types').MirrorDiscoveredRequest): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_MIRROR_DISCOVERED, req),
+    promoteDiscovered: (
+      req: import('@shared/types').PromoteDiscoveredRequest
+    ): Promise<import('@shared/types').InstalledSkill> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_PROMOTE_DISCOVERED, req),
+    deleteNative: (
+      target: import('@shared/types').SkillTarget,
+      name: string,
+      options: import('@shared/types').DeleteNativeOptions
+    ): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_DELETE_NATIVE, target, name, options),
     onChanged: (
       callback: (skills: import('@shared/types').InstalledSkill[]) => void
     ): (() => void) => {

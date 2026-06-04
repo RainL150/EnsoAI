@@ -133,3 +133,42 @@ export interface UpdateAvailableInfo {
   currentHash: string;
   remoteHash: string;
 }
+
+/**
+ * A skill found at a provider's dir that is NOT yet registered in the v2 lock
+ * (i.e., not gateway-managed and not in any installed skill's targets).
+ * Surfaced as a read-only overlay so the user sees pre-existing native skills
+ * with explicit "mirror to other CLI" / "promote (take over)" / "delete" actions.
+ */
+export interface DiscoveredSkill {
+  target: SkillTarget;
+  name: string;
+  description?: string;
+  /** Absolute path of the actual content (resolved through symlink). */
+  contentPath: string;
+  kind: 'symlink-external' | 'real-dir';
+  /** Present when kind='symlink-external'. */
+  symlinkTarget?: string;
+  contentHash: string;
+}
+
+export interface MirrorDiscoveredRequest {
+  /** Provider where the skill currently lives. */
+  origin: SkillTarget;
+  name: string;
+  /** Provider to mirror to. Must differ from origin. */
+  toTarget: SkillTarget;
+  mode: SkillInstallMode;
+}
+
+export interface PromoteDiscoveredRequest {
+  origin: SkillTarget;
+  name: string;
+}
+
+export interface DeleteNativeOptions {
+  /** Default true — go to system Trash so the user can restore via Finder. */
+  moveToTrash: boolean;
+  /** Default true — also clean up gateway mirrors pointing at the deleted path. */
+  alsoRemoveMirrors: boolean;
+}

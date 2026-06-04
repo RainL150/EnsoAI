@@ -1,10 +1,16 @@
 // Top-level orchestrator. Ties Sources / Repository / Installer / Lock together.
 // All write ops go through the WriteQueue to serialize lock-file mutations.
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type {
   AvailableSkill,
+  DeleteNativeOptions,
+  DiscoveredSkill,
   InstalledSkill,
   InstallSkillRequest,
+  MirrorDiscoveredRequest,
+  PromoteDiscoveredRequest,
   SkillInstallMode,
   SkillSource,
   SkillTarget,
@@ -12,13 +18,16 @@ import type {
   UpdateAvailableInfo,
 } from '@shared/types';
 import { shell } from 'electron';
+import { copyDir, linkOrCopy, readlinkAbsolute, unlinkSafe } from './linker';
+import { getProvider } from './providers';
+import { findDiscovered, listAllDiscovered } from './SkillDiscovery';
 import {
   checkTargetStatus,
   getTargetPath,
   installToTarget,
   uninstallFromTarget,
 } from './SkillInstaller';
-import { ensureLayout, readLock, writeLock } from './SkillLockStore';
+import { ensureLayout, generateSourceId, readLock, writeLock } from './SkillLockStore';
 import { migrateV1IfNeeded } from './SkillMigration';
 import { scanSource } from './SkillRepository';
 import { SkillScheduler } from './SkillScheduler';
@@ -389,6 +398,170 @@ export class SkillGatewayManager {
     const skill = lock.skills.find((s) => s.id === skillId);
     if (!skill) throw makeError('ENOENT_SKILL', `Skill ${skillId} not found`);
     await shell.openPath(skill.contentPath);
+  }
+
+  // ---------- Native discovery / mirror / promote / delete ----------
+
+  async listDiscovered(): Promise<DiscoveredSkill[]> {
+    return listAllDiscovered();
+  }
+
+  /**
+   * Create a mirror of a native skill at another provider's dir. Pure FS op —
+   * does NOT add to lock (the mirror itself becomes a new "discovered" entry
+   * at the other provider on next scan, which is accurate).
+   */
+  async mirrorDiscovered(req: MirrorDiscoveredRequest): Promise<void> {
+    return this.writeQueue.run(async () => {
+      if (req.origin === req.toTarget) {
+        throw makeError('EINVAL', 'origin and toTarget must differ');
+      }
+      const item = await findDiscovered(req.origin, req.name);
+      if (!item) {
+        throw makeError(
+          'ENOENT_DISCOVERED',
+          `Native skill ${req.name} not found under ${req.origin}`
+        );
+      }
+      const dst = path.join(getProvider(req.toTarget).getSkillsDir(), req.name);
+      await fs.promises.mkdir(path.dirname(dst), { recursive: true });
+      try {
+        await fs.promises.lstat(dst);
+        throw makeError('EEXIST_TARGET', `${dst} already exists; remove it first`);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+      if (req.mode === 'symlink') {
+        await linkOrCopy(item.contentPath, dst);
+      } else {
+        await copyDir(item.contentPath, dst);
+      }
+      // No lock mutation, but refresh listeners so the discovery overlay updates.
+      this.notify((await readLock()).skills);
+    });
+  }
+
+  /**
+   * Adopt a native discovered skill into gateway management.
+   * - symlink-external: register source pointing at the symlink target (dev dir);
+   *   re-install the original symlink (which is idempotent since the link already
+   *   points there).
+   * - real-dir: register source pointing at the provider path itself.
+   *   SkillInstaller detects the in-place case (contentPath === dst) and no-ops.
+   */
+  async promoteDiscovered(req: PromoteDiscoveredRequest): Promise<InstalledSkill> {
+    return this.writeQueue.run(async () => {
+      const item = await findDiscovered(req.origin, req.name);
+      if (!item) {
+        throw makeError(
+          'ENOENT_DISCOVERED',
+          `Native skill ${req.name} not found under ${req.origin}`
+        );
+      }
+
+      const lock = await readLock();
+      const localPath = item.symlinkTarget ?? item.contentPath;
+
+      if (lock.sources.find((s) => s.type === 'local' && s.localPath === localPath)) {
+        throw makeError('EEXIST_SOURCE', `A local source for ${localPath} already exists`);
+      }
+      if (lock.skills.find((s) => s.name === req.name && req.origin in s.targets)) {
+        throw makeError(
+          'EEXIST_INSTALLED',
+          `Skill ${req.name} is already managed for ${req.origin}`
+        );
+      }
+
+      const now = new Date().toISOString();
+      const sourceId = generateSourceId();
+      const source: SkillSource = {
+        id: sourceId,
+        type: 'local',
+        name: req.name,
+        localPath,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+      };
+      lock.sources.push(source);
+
+      const skill: InstalledSkill = {
+        id: `${sourceId}::${req.name}`,
+        sourceId,
+        name: req.name,
+        description: item.description,
+        contentPath: localPath,
+        contentHash: item.contentHash,
+        targets: {},
+        enabled: true,
+        installedAt: now,
+        updatedAt: now,
+      };
+
+      // Install at origin target. For symlink-external this rewrites the existing
+      // symlink to point at the dev dir (same as before — idempotent). For real-dir
+      // this is the in-place case → SkillInstaller no-ops.
+      const targetState = await installToTarget(skill, req.origin, {
+        mode: 'symlink',
+        backupExisting: true,
+      });
+      skill.targets[req.origin] = targetState;
+      lock.skills.push(skill);
+
+      await writeLock(lock);
+      this.notify(lock.skills);
+      return skill;
+    });
+  }
+
+  /**
+   * Destructive removal of a native entry at a provider path.
+   * Defaults to system Trash so the user can restore via Finder.
+   * Cascade-removes gateway mirrors pointing at the deleted path.
+   */
+  async deleteNative(
+    target: SkillTarget,
+    name: string,
+    options: DeleteNativeOptions
+  ): Promise<void> {
+    return this.writeQueue.run(async () => {
+      const fullPath = path.join(getProvider(target).getSkillsDir(), name);
+
+      if (options.alsoRemoveMirrors !== false) {
+        const lock = await readLock();
+        const others = (['claude', 'codex'] as SkillTarget[]).filter((t) => t !== target);
+        let mutated = false;
+        for (const otherTarget of others) {
+          const otherDst = path.join(getProvider(otherTarget).getSkillsDir(), name);
+          const resolved = await readlinkAbsolute(otherDst);
+          if (resolved && path.resolve(resolved) === path.resolve(fullPath)) {
+            await unlinkSafe(otherDst);
+          }
+        }
+        for (const skill of lock.skills) {
+          const state = skill.targets[target];
+          if (state && path.resolve(state.path) === path.resolve(fullPath)) {
+            delete skill.targets[target];
+            skill.updatedAt = new Date().toISOString();
+            mutated = true;
+          }
+        }
+        if (mutated) await writeLock(lock);
+      }
+
+      // Idempotent against missing file; surface every other failure to the caller
+      // so the user keeps their safety net (e.g. Trash permission denied stays visible).
+      try {
+        if (options.moveToTrash !== false) {
+          await shell.trashItem(fullPath);
+        } else {
+          await fs.promises.rm(fullPath, { recursive: true, force: true });
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+      this.notify((await readLock()).skills);
+    });
   }
 
   // ---------- internals ----------
