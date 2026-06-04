@@ -9,6 +9,7 @@ export type SettingsCategory =
   | 'agent'
   | 'ai'
   | 'integration'
+  | 'skills'
   | 'hapi'
   | 'webInspector';
 

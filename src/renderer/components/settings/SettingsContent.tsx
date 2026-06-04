@@ -8,6 +8,7 @@ import {
   Settings,
   Share2,
   Sparkles,
+  Wand2,
 } from 'lucide-react';
 import * as React from 'react';
 import { useI18n } from '@/i18n';
@@ -21,6 +22,7 @@ import { GeneralSettings } from './GeneralSettings';
 import { HapiSettings } from './HapiSettings';
 import { IntegrationSettings } from './IntegrationSettings';
 import { KeybindingsSettings } from './KeybindingsSettings';
+import { SkillsSection } from './skills/SkillsSection';
 import { WebInspectorSettings } from './WebInspectorSettings';
 
 interface SettingsContentProps {
@@ -56,6 +58,7 @@ export function SettingsContent({
     { id: 'agent', icon: Bot, label: t('Agent') },
     { id: 'ai', icon: Sparkles, label: t('AI') },
     { id: 'integration', icon: Link, label: t('Claude Integration') },
+    { id: 'skills', icon: Wand2, label: t('Skills') },
     { id: 'hapi', icon: Share2, label: t('Remote Sharing') },
     { id: 'webInspector', icon: Globe, label: t('Web Inspector') },
   ];
@@ -93,6 +96,7 @@ export function SettingsContent({
         {activeCategory === 'integration' && (
           <IntegrationSettings scrollToProvider={scrollToProvider} />
         )}
+        {activeCategory === 'skills' && <SkillsSection />}
         {activeCategory === 'hapi' && <HapiSettings />}
         {activeCategory === 'webInspector' && <WebInspectorSettings />}
       </div>
