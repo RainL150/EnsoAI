@@ -33,7 +33,7 @@ export function NativeSkillCard({ skill, onDelete, onChanged }: NativeSkillCardP
       });
       toastManager.add({
         type: 'success',
-        title: `${t('Mirrored to')} ${TARGET_LABELS[otherTarget]}`,
+        title: `${t('已复制到')} ${TARGET_LABELS[otherTarget]}`,
       });
       await onChanged();
     } catch (err) {
@@ -50,7 +50,7 @@ export function NativeSkillCard({ skill, onDelete, onChanged }: NativeSkillCardP
         origin: skill.target,
         name: skill.name,
       });
-      toastManager.add({ type: 'success', title: t('Promoted to gateway management') });
+      toastManager.add({ type: 'success', title: t('已接管') });
       await onChanged();
     } catch (err) {
       toastManager.add({ type: 'error', title: (err as Error).message });
@@ -112,7 +112,7 @@ export function NativeSkillCard({ skill, onDelete, onChanged }: NativeSkillCardP
           ) : (
             <Check className="h-3 w-3 mr-1" />
           )}
-          {t('Mirror to')} {TARGET_LABELS[otherTarget]}
+          {t('复制到')} {TARGET_LABELS[otherTarget]}
         </Button>
         <Button
           variant="outline"
@@ -122,7 +122,7 @@ export function NativeSkillCard({ skill, onDelete, onChanged }: NativeSkillCardP
           disabled={promoting}
         >
           {promoting && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
-          {t('Take over')}
+          {t('接管')}
         </Button>
         <div className="flex-1" />
         <Button

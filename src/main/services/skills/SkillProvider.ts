@@ -6,8 +6,13 @@ import type { SkillTarget } from '@shared/types';
 
 export interface SkillProvider {
   readonly target: SkillTarget;
-  /** Absolute path to this CLI's user-scope skills directory. */
+  /** Absolute path to this CLI's canonical user-scope skills directory. */
   getSkillsDir(): string;
+  /**
+   * Absolute directories to scan for pre-existing native skills. Defaults to
+   * the canonical skills dir; providers can add compatibility locations.
+   */
+  getDiscoveryDirs?(): string[];
   /** Whether the skills dir exists or can be created and is writable. */
   isAvailable(): Promise<boolean>;
 }

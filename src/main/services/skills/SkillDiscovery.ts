@@ -13,6 +13,11 @@ import { getSourcesCacheRoot, readLock } from './SkillLockStore';
 
 const ALL_TARGETS: SkillTarget[] = ['claude', 'codex'];
 
+function getDiscoveryDirs(target: SkillTarget): string[] {
+  const provider = getProvider(target);
+  return provider.getDiscoveryDirs?.() ?? [provider.getSkillsDir()];
+}
+
 /** Symlink whose target resolves inside ~/.ensoai/sources — already gateway-managed. */
 async function isGatewayLink(linkPath: string, sourcesRoot: string): Promise<boolean> {
   const resolved = await readlinkAbsolute(linkPath);
@@ -26,88 +31,92 @@ async function scanProvider(
   sourcesRoot: string,
   excludeNames: Set<string>
 ): Promise<DiscoveredSkill[]> {
-  const dir = getProvider(target).getSkillsDir();
-  let entries: fs.Dirent[];
-  try {
-    entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    return [];
-  }
-
   const out: DiscoveredSkill[] = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
-    if (excludeNames.has(entry.name)) continue;
-
-    const fullPath = path.join(dir, entry.name);
-
-    if (await isGatewayLink(fullPath, sourcesRoot)) continue;
-
-    let stat: fs.Stats;
+  const seenNames = new Set<string>();
+  for (const dir of getDiscoveryDirs(target)) {
+    let entries: fs.Dirent[];
     try {
-      stat = await fs.promises.lstat(fullPath);
-    } catch {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
       continue;
     }
 
-    let kind: 'symlink-external' | 'real-dir';
-    let symlinkTarget: string | undefined;
-    let contentPath: string;
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+      if (excludeNames.has(entry.name) || seenNames.has(entry.name)) continue;
 
-    if (stat.isSymbolicLink()) {
-      const resolved = await readlinkAbsolute(fullPath);
-      if (!resolved) continue;
-      kind = 'symlink-external';
-      symlinkTarget = resolved;
-      contentPath = resolved;
-    } else if (stat.isDirectory()) {
-      kind = 'real-dir';
-      contentPath = fullPath;
-    } else {
-      continue;
-    }
+      const fullPath = path.join(dir, entry.name);
 
-    // Verify the resolved content actually contains a SKILL.md
-    let hasSkillMd = false;
-    try {
-      const children = await fs.promises.readdir(contentPath);
-      hasSkillMd = children.some((c) => c.toLowerCase() === 'skill.md');
-    } catch {
-      continue;
-    }
-    if (!hasSkillMd) continue;
+      if (await isGatewayLink(fullPath, sourcesRoot)) continue;
 
-    let description: string | undefined;
-    try {
-      const skillMdPath = path.join(contentPath, 'SKILL.md');
-      let content: string;
+      let stat: fs.Stats;
       try {
-        content = await fs.promises.readFile(skillMdPath, 'utf-8');
+        stat = await fs.promises.lstat(fullPath);
       } catch {
-        content = await fs.promises.readFile(path.join(contentPath, 'skill.md'), 'utf-8');
+        continue;
       }
-      description = parseSkillFrontMatter(content)?.description;
-    } catch {
-      // best-effort; description is optional
-    }
 
-    let contentHash: string;
-    try {
-      contentHash = await hashDir(contentPath);
-    } catch {
-      continue;
-    }
+      let kind: 'symlink-external' | 'real-dir';
+      let symlinkTarget: string | undefined;
+      let contentPath: string;
 
-    out.push({
-      target,
-      name: entry.name,
-      description,
-      contentPath,
-      kind,
-      symlinkTarget,
-      contentHash,
-    });
+      if (stat.isSymbolicLink()) {
+        const resolved = await readlinkAbsolute(fullPath);
+        if (!resolved) continue;
+        kind = 'symlink-external';
+        symlinkTarget = resolved;
+        contentPath = resolved;
+      } else if (stat.isDirectory()) {
+        kind = 'real-dir';
+        contentPath = fullPath;
+      } else {
+        continue;
+      }
+
+      // Verify the resolved content actually contains a SKILL.md
+      let hasSkillMd = false;
+      try {
+        const children = await fs.promises.readdir(contentPath);
+        hasSkillMd = children.some((c) => c.toLowerCase() === 'skill.md');
+      } catch {
+        continue;
+      }
+      if (!hasSkillMd) continue;
+
+      let description: string | undefined;
+      try {
+        const skillMdPath = path.join(contentPath, 'SKILL.md');
+        let content: string;
+        try {
+          content = await fs.promises.readFile(skillMdPath, 'utf-8');
+        } catch {
+          content = await fs.promises.readFile(path.join(contentPath, 'skill.md'), 'utf-8');
+        }
+        description = parseSkillFrontMatter(content)?.description;
+      } catch {
+        // best-effort; description is optional
+      }
+
+      let contentHash: string;
+      try {
+        contentHash = await hashDir(contentPath);
+      } catch {
+        continue;
+      }
+
+      seenNames.add(entry.name);
+      out.push({
+        target,
+        name: entry.name,
+        description,
+        providerPath: fullPath,
+        contentPath,
+        kind,
+        symlinkTarget,
+        contentHash,
+      });
+    }
   }
   return out;
 }

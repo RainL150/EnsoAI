@@ -1,6 +1,8 @@
 // Codex CLI skill provider — writes to ~/.agents/skills/<name>/.
 // Per OpenAI Codex docs (developers.openai.com/codex/skills) user-scope
 // skills live under $HOME/.agents/skills/, NOT $HOME/.codex/.
+// Discovery also scans ~/.codex/skills for compatibility with older/current
+// harness-local Codex setups that still expose skills from that directory.
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -13,6 +15,10 @@ export class CodexSkillProvider implements SkillProvider {
 
   getSkillsDir(): string {
     return path.join(os.homedir(), '.agents', 'skills');
+  }
+
+  getDiscoveryDirs(): string[] {
+    return [this.getSkillsDir(), path.join(os.homedir(), '.codex', 'skills')];
   }
 
   async isAvailable(): Promise<boolean> {
