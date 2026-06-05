@@ -65,6 +65,12 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
+function getDiscoveryDirs(source: SkillSource): string[] {
+  if (!source.nativeTarget) return [];
+  const provider = getProvider(source.nativeTarget);
+  return provider.getDiscoveryDirs?.() ?? [provider.getSkillsDir()];
+}
+
 /**
  * Clone if missing; otherwise fetch + hard reset to origin/<branch>.
  * Returns the absolute path to the clone dir.
@@ -169,15 +175,10 @@ export async function scanSource(source: SkillSource): Promise<ScanResult> {
 
   const warnings: string[] = [];
 
-  let scanRoot: string;
-  try {
-    if (source.type === 'git') {
-      await ensureGitClone(source);
-    }
-    scanRoot = await resolveScanRoot(source);
-  } catch (err) {
-    throw err;
+  if (source.type === 'git') {
+    await ensureGitClone(source);
   }
+  const scanRoot = await resolveScanRoot(source);
 
   // sourceDir defaults to '.' (root). Resolve relative to the scan root.
   const sourceDir = source.sourceDir?.trim() || '.';
@@ -234,94 +235,96 @@ export async function scanSource(source: SkillSource): Promise<ScanResult> {
  * recurse. The skill name is the directory name (not parsed frontmatter),
  * because provider expectations require exact dir-name == skill-name.
  *
- * `takenOverBySourceId` is left undefined here; GatewayManager.browse fills it
- * in by cross-referencing lock.skills[].targets[<nativeTarget>].path.
+ * `takenOver` is left undefined here; GatewayManager.browse fills it in by
+ * checking whether the skill name is already installed under the native
+ * source id (i.e., promote already happened).
  */
 async function scanNativeSource(source: SkillSource): Promise<ScanResult> {
   const warnings: string[] = [];
   if (!source.nativeTarget) {
     return { skills: [], warnings: ['native source missing nativeTarget'] };
   }
-  const provider = getProvider(source.nativeTarget);
-  const dir = provider.getSkillsDir();
-
-  let entries: fs.Dirent[];
-  try {
-    entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { skills: [], warnings: [] };
-    }
-    throw err;
-  }
-
   const skills: AvailableSkill[] = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
-    const fullPath = path.join(dir, entry.name);
-
-    let stat: fs.Stats;
+  const seenNames = new Set<string>();
+  for (const dir of getDiscoveryDirs(source)) {
+    let entries: fs.Dirent[];
     try {
-      stat = await fs.promises.lstat(fullPath);
-    } catch {
-      continue;
-    }
-
-    let kind: 'symlink-external' | 'real-dir';
-    let symlinkTarget: string | undefined;
-    let contentPath: string;
-
-    if (stat.isSymbolicLink()) {
-      const resolved = await readlinkAbsolute(fullPath);
-      if (!resolved) continue;
-      kind = 'symlink-external';
-      symlinkTarget = resolved;
-      contentPath = resolved;
-    } else if (stat.isDirectory()) {
-      kind = 'real-dir';
-      contentPath = fullPath;
-    } else {
-      continue;
-    }
-
-    // Must contain SKILL.md to count as a skill
-    let hasSkillMd = false;
-    try {
-      const children = await fs.promises.readdir(contentPath);
-      hasSkillMd = children.some((c) => c.toLowerCase() === 'skill.md');
-    } catch {
-      continue;
-    }
-    if (!hasSkillMd) continue;
-
-    let description: string | undefined;
-    let version: string | undefined;
-    const content = await readSkillMd(contentPath);
-    if (content) {
-      const meta = parseSkillFrontMatter(content);
-      description = meta?.description;
-      version = meta?.version;
-    }
-
-    let contentHash: string;
-    try {
-      contentHash = await hashDir(contentPath);
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
     } catch (err) {
-      warnings.push(`skipped ${fullPath}: hash failed (${(err as Error).message})`);
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
       continue;
     }
 
-    skills.push({
-      sourceId: source.id,
-      name: entry.name,
-      description,
-      version,
-      contentPath,
-      contentHash,
-      installed: false,
-      nativeKind: kind,
-      nativeSymlinkTarget: symlinkTarget,
-    });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+      if (seenNames.has(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+
+      let stat: fs.Stats;
+      try {
+        stat = await fs.promises.lstat(fullPath);
+      } catch {
+        continue;
+      }
+
+      let kind: 'symlink-external' | 'real-dir';
+      let symlinkTarget: string | undefined;
+      let contentPath: string;
+
+      if (stat.isSymbolicLink()) {
+        const resolved = await readlinkAbsolute(fullPath);
+        if (!resolved) continue;
+        kind = 'symlink-external';
+        symlinkTarget = resolved;
+        contentPath = resolved;
+      } else if (stat.isDirectory()) {
+        kind = 'real-dir';
+        contentPath = fullPath;
+      } else {
+        continue;
+      }
+
+      // Must contain SKILL.md to count as a skill
+      let hasSkillMd = false;
+      try {
+        const children = await fs.promises.readdir(contentPath);
+        hasSkillMd = children.some((c) => c.toLowerCase() === 'skill.md');
+      } catch {
+        continue;
+      }
+      if (!hasSkillMd) continue;
+
+      let description: string | undefined;
+      let version: string | undefined;
+      const content = await readSkillMd(contentPath);
+      if (content) {
+        const meta = parseSkillFrontMatter(content);
+        description = meta?.description;
+        version = meta?.version;
+      }
+
+      let contentHash: string;
+      try {
+        contentHash = await hashDir(contentPath);
+      } catch (err) {
+        warnings.push(`skipped ${fullPath}: hash failed (${(err as Error).message})`);
+        continue;
+      }
+
+      seenNames.add(entry.name);
+      skills.push({
+        sourceId: source.id,
+        name: entry.name,
+        description,
+        version,
+        contentPath,
+        contentHash,
+        installed: false,
+        nativeKind: kind,
+        nativeSymlinkTarget: symlinkTarget,
+        nativeProviderPath: fullPath,
+      });
+    }
   }
 
   return { skills, warnings };

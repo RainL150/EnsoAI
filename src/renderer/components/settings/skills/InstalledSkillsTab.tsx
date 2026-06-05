@@ -1,10 +1,10 @@
 import type {
   DiscoveredSkill,
   InstalledSkill,
-  SkillSource,
   SkillTarget,
   SkillTargetStatus,
 } from '@shared/types';
+import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { Check, FolderOpen, History, Loader2, RefreshCw, Trash2, Wand2, X } from 'lucide-react';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
@@ -32,7 +32,6 @@ export function InstalledSkillsTab() {
   const { t } = useI18n();
   const [skills, setSkills] = React.useState<InstalledSkill[]>([]);
   const [discovered, setDiscovered] = React.useState<DiscoveredSkill[]>([]);
-  const [sources, setSources] = React.useState<SkillSource[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [syncingId, setSyncingId] = React.useState<string | null>(null);
   const [uninstallingId, setUninstallingId] = React.useState<string | null>(null);
@@ -42,14 +41,12 @@ export function InstalledSkillsTab() {
 
   const reload = React.useCallback(async () => {
     try {
-      const [managed, native, sourceList] = await Promise.all([
+      const [managed, native] = await Promise.all([
         window.electronAPI.skills.list(),
         window.electronAPI.skills.listDiscovered(),
-        window.electronAPI.skills.sources.list(),
       ]);
       setSkills(managed);
       setDiscovered(native);
-      setSources(sourceList);
     } catch (err) {
       console.error('[InstalledSkillsTab] load failed:', err);
       toastManager.add({ type: 'error', title: t('Failed to load skills') });
@@ -58,16 +55,13 @@ export function InstalledSkillsTab() {
     }
   }, [t]);
 
-  // A "promoted" skill is one whose source is a local source auto-created by
-  // promoteDiscovered. Heuristic: source.type==='local' and the skill has
-  // exactly one target — exactly how promoteDiscovered builds them.
+  // A "promoted" skill is one owned by a built-in native source — promote
+  // attaches the InstalledSkill directly to claude-native / codex-native so
+  // SourcesTab doesn't get polluted.
   const isPromoted = React.useCallback(
-    (skill: InstalledSkill): boolean => {
-      const source = sources.find((s) => s.id === skill.sourceId);
-      if (!source || source.type !== 'local') return false;
-      return Object.keys(skill.targets).length === 1;
-    },
-    [sources]
+    (skill: InstalledSkill): boolean =>
+      skill.sourceId === CLAUDE_NATIVE_SOURCE_ID || skill.sourceId === CODEX_NATIVE_SOURCE_ID,
+    []
   );
 
   React.useEffect(() => {
@@ -110,21 +104,17 @@ export function InstalledSkillsTab() {
   };
 
   const handleToggleTarget = async (skill: InstalledSkill, target: SkillTarget) => {
-    const current = skill.targets;
-    const has = target in current && current[target];
-    const next = { ...current };
+    const next = Object.fromEntries(
+      Object.entries(skill.targets).map(([k, v]) => [k, { mode: v?.mode ?? 'symlink' }])
+    ) as Partial<Record<SkillTarget, { mode: 'symlink' | 'copy' }>>;
+    const has = target in next && next[target];
     if (has) {
       delete next[target];
     } else {
       next[target] = { mode: 'symlink' };
     }
     try {
-      await window.electronAPI.skills.setTargets(
-        skill.id,
-        Object.fromEntries(
-          Object.entries(next).map(([k, v]) => [k, { mode: v?.mode ?? 'symlink' }])
-        ) as Partial<Record<SkillTarget, { mode: 'symlink' | 'copy' }>>
-      );
+      await window.electronAPI.skills.setTargets(skill.id, next);
     } catch (err) {
       toastManager.add({ type: 'error', title: (err as Error).message });
       reload();

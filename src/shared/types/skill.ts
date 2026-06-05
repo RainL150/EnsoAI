@@ -70,11 +70,11 @@ export interface AvailableSkill {
   contentHash: string;
   installed: boolean;
   /**
-   * For type='native' sources only: when set, the skill has been promoted to
-   * a user-managed local source with this id (the entry no longer "belongs" to
-   * native — UI should show "已接管" badge and route actions through that source).
+   * For type='native' sources only: true when this skill is already gateway-
+   * managed (an InstalledSkill exists under the native source id with this name).
+   * UI shows the "已接管" badge based on this flag.
    */
-  takenOverBySourceId?: string;
+  takenOver?: boolean;
   /**
    * For type='native' sources only: 'symlink-external' or 'real-dir'.
    * Drives the kind-aware promote dialog.
@@ -82,6 +82,8 @@ export interface AvailableSkill {
   nativeKind?: 'symlink-external' | 'real-dir';
   /** Only present when nativeKind='symlink-external'. */
   nativeSymlinkTarget?: string;
+  /** Actual native provider entry path. Present for native sources. */
+  nativeProviderPath?: string;
 }
 
 export interface SkillTargetState {
@@ -165,6 +167,8 @@ export interface DiscoveredSkill {
   target: SkillTarget;
   name: string;
   description?: string;
+  /** Absolute path of the provider entry, before resolving symlinks. */
+  providerPath: string;
   /** Absolute path of the actual content (resolved through symlink). */
   contentPath: string;
   kind: 'symlink-external' | 'real-dir';

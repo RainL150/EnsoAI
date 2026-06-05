@@ -127,7 +127,7 @@ export function BrowseSkillsTab() {
           {filtered.map((skill) => {
             const source = sourceById.get(skill.sourceId);
             const isNative = source?.type === 'native';
-            const isTakenOver = !!skill.takenOverBySourceId;
+            const isTakenOver = !!skill.takenOver;
             const key = `${skill.sourceId}::${skill.name}`;
             const promoting = promotingKey === key;
             return (

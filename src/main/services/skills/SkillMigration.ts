@@ -5,12 +5,15 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { InstalledSkill, SkillSource } from '@shared/types';
+import type { InstalledSkill, SkillSource, SkillTarget } from '@shared/types';
+import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { parseSkillFrontMatter } from '../../utils/skillFrontmatter';
+import { unlinkSafe } from './linker';
 import { hashDir } from './SkillHash';
 import {
   ensureLayout,
   generateSourceId,
+  getCanonicalContentRoot,
   getEnsoaiRoot,
   getLegacyV1IndexPath,
   getSourcesCacheRoot,
@@ -233,4 +236,155 @@ async function readSkillMeta(
     }
   }
   return null;
+}
+
+// ---------- M11: v2.5 promoted-source migration ----------
+
+export interface V25MigrationResult {
+  migrated: boolean;
+  promotedFixed: number;
+  warnings: string[];
+}
+
+interface Candidate {
+  source: SkillSource;
+  skill: InstalledSkill;
+  target: SkillTarget;
+  flavor: 'real-dir' | 'symlink-external';
+}
+
+function nativeSourceIdFor(target: SkillTarget): string {
+  return target === 'claude' ? CLAUDE_NATIVE_SOURCE_ID : CODEX_NATIVE_SOURCE_ID;
+}
+
+async function readlinkAbs(p: string): Promise<string | null> {
+  try {
+    const stat = await fs.promises.lstat(p);
+    if (!stat.isSymbolicLink()) return null;
+    const target = await fs.promises.readlink(p);
+    return path.isAbsolute(target) ? target : path.resolve(path.dirname(p), target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rewrite v2.5 promote artifacts to the M11 model:
+ *   - Auto-generated type='local' sources with exactly one dependent skill
+ *     get removed.
+ *   - The dependent InstalledSkill is re-attached to the matching native
+ *     source sentinel (claude-native / codex-native).
+ *   - real-dir flavor: content moves from canonical/<oldSourceId>/<name>/
+ *     to canonical/<target>/<name>/, and the provider-side symlink is
+ *     repointed.
+ *   - symlink-external flavor: no FS work — dev dir is preserved.
+ *
+ * Idempotent: re-running on already-migrated state is a no-op (the
+ * canonical-rooted localPath heuristic and the symlink-target check both
+ * fail once the source has been removed).
+ */
+export async function migrateV25PromotedIfNeeded(): Promise<V25MigrationResult> {
+  const warnings: string[] = [];
+  const lock = await readLock();
+  const canonicalRoot = path.resolve(getCanonicalContentRoot());
+
+  const candidates: Candidate[] = [];
+  for (const source of lock.sources) {
+    if (source.type !== 'local' || !source.localPath) continue;
+
+    const deps = lock.skills.filter((s) => s.sourceId === source.id);
+    if (deps.length !== 1) continue;
+    const skill = deps[0];
+
+    const targets = Object.keys(skill.targets) as SkillTarget[];
+    if (targets.length !== 1) continue;
+    const target = targets[0];
+
+    const localAbs = path.resolve(source.localPath);
+    const isUnderCanonical =
+      localAbs === canonicalRoot || localAbs.startsWith(canonicalRoot + path.sep);
+
+    if (isUnderCanonical) {
+      candidates.push({ source, skill, target, flavor: 'real-dir' });
+      continue;
+    }
+
+    // Symlink-external probe: providerPath must be a symlink whose target == localPath
+    const providerPath = skill.targets[target]?.path;
+    if (!providerPath) continue;
+    const linkTarget = await readlinkAbs(providerPath);
+    if (linkTarget && path.resolve(linkTarget) === localAbs) {
+      candidates.push({ source, skill, target, flavor: 'symlink-external' });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return { migrated: false, promotedFixed: 0, warnings };
+  }
+
+  let promotedFixed = 0;
+
+  for (const { source, skill, target, flavor } of candidates) {
+    try {
+      const nativeId = nativeSourceIdFor(target);
+      let newContentPath = skill.contentPath;
+
+      if (flavor === 'real-dir') {
+        const targetDir = path.join(canonicalRoot, target);
+        await fs.promises.mkdir(targetDir, { recursive: true });
+        newContentPath = path.join(targetDir, skill.name);
+
+        // Refuse to clobber an existing path at the new location.
+        let conflict = false;
+        try {
+          await fs.promises.access(newContentPath);
+          conflict = true;
+        } catch {
+          // expected — path does not exist
+        }
+        if (conflict) {
+          warnings.push(
+            `m11 skip ${skill.name}: ${newContentPath} already exists; manual review required`
+          );
+          continue;
+        }
+
+        await fs.promises.rename(skill.contentPath, newContentPath).catch(async (err) => {
+          if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+          await fs.promises.cp(skill.contentPath, newContentPath, { recursive: true });
+          await fs.promises.rm(skill.contentPath, { recursive: true, force: true });
+        });
+
+        // Drop the now-empty per-source canonical wrapper dir.
+        await fs.promises.rmdir(path.dirname(skill.contentPath)).catch(() => {});
+
+        // Repoint the provider symlink at the new canonical path.
+        const providerPath = skill.targets[target]?.path;
+        if (providerPath) {
+          await unlinkSafe(providerPath);
+          await fs.promises.symlink(newContentPath, providerPath, 'dir');
+        }
+      }
+      // symlink-external: leave fs alone; symlink already points at the dev dir.
+
+      // Re-key the InstalledSkill onto the native source.
+      skill.sourceId = nativeId;
+      skill.id = `${nativeId}::${skill.name}`;
+      skill.contentPath = newContentPath;
+      skill.updatedAt = new Date().toISOString();
+
+      // Drop the obsolete local source.
+      const idx = lock.sources.findIndex((s) => s.id === source.id);
+      if (idx !== -1) lock.sources.splice(idx, 1);
+
+      // Persist after each successful candidate so a mid-loop crash leaves
+      // a consistent partial state instead of a fully-mutated fs with stale lock.
+      await writeLock(lock);
+      promotedFixed++;
+    } catch (err) {
+      warnings.push(`m11 ${skill.name}: ${(err as Error).message}`);
+    }
+  }
+
+  return { migrated: promotedFixed > 0, promotedFixed, warnings };
 }
