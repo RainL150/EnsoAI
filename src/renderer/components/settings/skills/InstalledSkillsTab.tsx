@@ -216,8 +216,8 @@ export function InstalledSkillsTab() {
   }
 
   const visibleDiscovered =
-    filter === 'all' ? discovered : discovered.filter((d) => d.target === filter);
-  const visibleSkills = filter === 'all' ? skills : skills.filter((s) => filter in s.targets);
+    filter === 'all' ? [...discovered] : discovered.filter((d) => d.target === filter);
+  const visibleSkills = filter === 'all' ? [...skills] : skills.filter((s) => filter in s.targets);
 
   // Bundle source lookup + grouping of bundle-managed sub-skills.
   const sourceById = new Map(sources.map((s) => [s.id, s] as const));
@@ -242,6 +242,9 @@ export function InstalledSkillsTab() {
   // Stable order: bundle groups by source name; sub-skills by name.
   bundleGroups.sort((a, b) => a.source.name.localeCompare(b.source.name));
   for (const g of bundleGroups) g.skills.sort((a, b) => a.name.localeCompare(b.name));
+  // Non-bundle cards: managed (已接管) first, discovered (未接管) after — each by name.
+  nonBundleVisibleSkills.sort((a, b) => a.name.localeCompare(b.name));
+  visibleDiscovered.sort((a, b) => a.name.localeCompare(b.name));
 
   const filterTabs: Array<{ id: FilterTarget; label: string; count: number }> = [
     { id: 'all', label: t('全部'), count: skills.length + discovered.length },
@@ -397,14 +400,6 @@ export function InstalledSkillsTab() {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 pb-2">
-        {visibleDiscovered.map((d) => (
-          <NativeSkillCard
-            key={`native::${d.target}::${d.name}`}
-            skill={d}
-            onDelete={(s) => setDeleteTarget(s)}
-            onChanged={reload}
-          />
-        ))}
         {nonBundleVisibleSkills.map((skill) => (
           <div
             key={skill.id}
@@ -508,6 +503,14 @@ export function InstalledSkillsTab() {
               )}
             </div>
           </div>
+        ))}
+        {visibleDiscovered.map((d) => (
+          <NativeSkillCard
+            key={`native::${d.target}::${d.name}`}
+            skill={d}
+            onDelete={(s) => setDeleteTarget(s)}
+            onChanged={reload}
+          />
         ))}
       </div>
       <DeleteNativeDialog
