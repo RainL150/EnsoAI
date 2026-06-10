@@ -31,6 +31,11 @@ export interface InstallOptions {
   mode: SkillInstallMode;
   /** If true, back up any pre-existing entry before overwriting. Default true. */
   backupExisting?: boolean;
+  /**
+   * Required for mode='bundle-wrapper'. Source id of the bundle that owns
+   * the on-disk wrapper. Stored on the resulting SkillTargetState.managedBy.
+   */
+  managedBy?: string;
 }
 
 /**
@@ -53,6 +58,24 @@ export async function installToTarget(
   const provider = getProvider(target);
   if (!(await provider.isAvailable())) {
     throw makeError('EUNAVAILABLE_TARGET', `Target ${target} is not writable`);
+  }
+
+  // Bundle-wrapper mode: the wrapper at dst is owned by an external installer
+  // (e.g. gstack setup). We never write FS — we only register the state and
+  // probe whether the expected wrapper layout is actually present.
+  if (options.mode === 'bundle-wrapper') {
+    if (!options.managedBy) {
+      throw makeError('EINVAL', 'bundle-wrapper install requires managedBy (bundle sourceId)');
+    }
+    const dst = getTargetPath(target, skill.name);
+    const status = await probeBundleWrapperStatus(dst, skill.contentPath);
+    return {
+      mode: 'bundle-wrapper',
+      path: dst,
+      status,
+      installedAt: new Date().toISOString(),
+      managedBy: options.managedBy,
+    };
   }
 
   const dst = getTargetPath(target, skill.name);
@@ -112,13 +135,27 @@ export async function installToTarget(
   };
 }
 
+export interface UninstallOptions {
+  /**
+   * When true, do not touch the on-disk entry at the target path. Used for
+   * mode='bundle-wrapper' uninstall — the wrapper is owned by the bundle's
+   * installer (e.g. gstack), so we only drop the lock row.
+   */
+  preserveFs?: boolean;
+}
+
 /**
  * Remove the target entry. No-op if missing.
  * Does NOT touch skill.contentPath — that's the responsibility of GatewayManager
  * (and only for 'git' source skills; 'local' sources must never have their
  * contentPath deleted).
  */
-export async function uninstallFromTarget(target: SkillTarget, name: string): Promise<void> {
+export async function uninstallFromTarget(
+  target: SkillTarget,
+  name: string,
+  options: UninstallOptions = {}
+): Promise<void> {
+  if (options.preserveFs) return;
   await unlinkSafe(getTargetPath(target, name));
 }
 
@@ -130,6 +167,10 @@ export async function checkTargetStatus(
   skill: Pick<InstalledSkill, 'name' | 'contentPath'>,
   state: SkillTargetState
 ): Promise<SkillTargetStatus> {
+  if (state.mode === 'bundle-wrapper') {
+    return probeBundleWrapperStatus(state.path, skill.contentPath);
+  }
+
   const existing = await peekTarget(state.path);
   if (existing.kind === 'missing') return 'missing';
 
@@ -147,6 +188,41 @@ export async function checkTargetStatus(
   } catch {
     return 'missing';
   }
+}
+
+/**
+ * Probe whether `wrapperPath` is a valid bundle-installer wrapper pointing at
+ * `contentPath` (the bundle sub-skill on disk). Two accepted layouts:
+ *   1. wrapperPath is a directory-level symlink → contentPath
+ *   2. wrapperPath is a real directory whose `SKILL.md` is a file-symlink
+ *      → contentPath/SKILL.md  (gstack's convention)
+ *
+ * Returns 'bundle-managed' when either layout matches, 'missing' when the
+ * wrapper does not exist, 'wrong-symlink' otherwise.
+ */
+async function probeBundleWrapperStatus(
+  wrapperPath: string,
+  contentPath: string
+): Promise<SkillTargetStatus> {
+  const peek = await peekTarget(wrapperPath);
+  if (peek.kind === 'missing') return 'missing';
+  const contentAbs = path.resolve(contentPath);
+
+  if (peek.kind === 'managed-symlink') {
+    return peek.resolved === contentAbs ? 'bundle-managed' : 'wrong-symlink';
+  }
+
+  if (peek.kind === 'directory') {
+    const skillMdPath = path.join(wrapperPath, 'SKILL.md');
+    const altPath = path.join(wrapperPath, 'skill.md');
+    const resolved = (await readlinkAbsolute(skillMdPath)) ?? (await readlinkAbsolute(altPath));
+    if (!resolved) return 'wrong-symlink';
+    const expected = path.join(contentAbs, 'SKILL.md');
+    const expectedAlt = path.join(contentAbs, 'skill.md');
+    return resolved === expected || resolved === expectedAlt ? 'bundle-managed' : 'wrong-symlink';
+  }
+
+  return 'wrong-symlink';
 }
 
 // ----- internals -----

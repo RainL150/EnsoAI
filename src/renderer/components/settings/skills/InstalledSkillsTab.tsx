@@ -1,11 +1,24 @@
 import type {
   DiscoveredSkill,
   InstalledSkill,
+  SkillSource,
   SkillTarget,
   SkillTargetStatus,
 } from '@shared/types';
 import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
-import { Check, FolderOpen, History, Loader2, RefreshCw, Trash2, Wand2, X } from 'lucide-react';
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  FolderOpen,
+  History,
+  Loader2,
+  Package,
+  RefreshCw,
+  Trash2,
+  Wand2,
+  X,
+} from 'lucide-react';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -23,6 +36,7 @@ const TARGET_LABELS: Record<SkillTarget, string> = { claude: 'Claude', codex: 'C
 
 const STATUS_COLORS: Record<SkillTargetStatus, string> = {
   managed: 'bg-emerald-500/15 text-emerald-600 border-emerald-500/30',
+  'bundle-managed': 'bg-sky-500/15 text-sky-600 border-sky-500/30',
   modified: 'bg-amber-500/15 text-amber-600 border-amber-500/30',
   missing: 'bg-muted text-muted-foreground border-border',
   'wrong-symlink': 'bg-rose-500/15 text-rose-600 border-rose-500/30',
@@ -31,21 +45,26 @@ const STATUS_COLORS: Record<SkillTargetStatus, string> = {
 export function InstalledSkillsTab() {
   const { t } = useI18n();
   const [skills, setSkills] = React.useState<InstalledSkill[]>([]);
+  const [sources, setSources] = React.useState<SkillSource[]>([]);
   const [discovered, setDiscovered] = React.useState<DiscoveredSkill[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [syncingId, setSyncingId] = React.useState<string | null>(null);
+  const [syncingBundleId, setSyncingBundleId] = React.useState<string | null>(null);
   const [uninstallingId, setUninstallingId] = React.useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<DiscoveredSkill | null>(null);
   const [unpromoteTarget, setUnpromoteTarget] = React.useState<InstalledSkill | null>(null);
   const [filter, setFilter] = React.useState<FilterTarget>('all');
+  const [expandedBundles, setExpandedBundles] = React.useState<Set<string>>(new Set());
 
   const reload = React.useCallback(async () => {
     try {
-      const [managed, native] = await Promise.all([
+      const [managed, sourceList, native] = await Promise.all([
         window.electronAPI.skills.list(),
+        window.electronAPI.skills.sources.list(),
         window.electronAPI.skills.listDiscovered(),
       ]);
       setSkills(managed);
+      setSources(sourceList);
       setDiscovered(native);
     } catch (err) {
       console.error('[InstalledSkillsTab] load failed:', err);
@@ -61,6 +80,15 @@ export function InstalledSkillsTab() {
   const isPromoted = React.useCallback(
     (skill: InstalledSkill): boolean =>
       skill.sourceId === CLAUDE_NATIVE_SOURCE_ID || skill.sourceId === CODEX_NATIVE_SOURCE_ID,
+    []
+  );
+
+  // Skill whose targets are all bundle-wrapper — wrapper on disk is owned by
+  // the bundle's installer (e.g. gstack); uninstalling here only drops the
+  // EnsoAI lock row.
+  const isBundleManaged = React.useCallback(
+    (skill: InstalledSkill): boolean =>
+      Object.values(skill.targets).some((s) => s?.mode === 'bundle-wrapper'),
     []
   );
 
@@ -145,6 +173,28 @@ export function InstalledSkillsTab() {
     }
   };
 
+  const handleSyncBundle = async (sourceId: string) => {
+    setSyncingBundleId(sourceId);
+    try {
+      await window.electronAPI.skills.syncBundle(sourceId);
+      toastManager.add({ type: 'success', title: t('Bundle 已同步') });
+      await reload();
+    } catch (err) {
+      toastManager.add({ type: 'error', title: (err as Error).message });
+    } finally {
+      setSyncingBundleId(null);
+    }
+  };
+
+  const toggleBundleExpanded = (sourceId: string) => {
+    setExpandedBundles((prev) => {
+      const next = new Set(prev);
+      if (next.has(sourceId)) next.delete(sourceId);
+      else next.add(sourceId);
+      return next;
+    });
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12 text-muted-foreground">
@@ -168,6 +218,30 @@ export function InstalledSkillsTab() {
   const visibleDiscovered =
     filter === 'all' ? discovered : discovered.filter((d) => d.target === filter);
   const visibleSkills = filter === 'all' ? skills : skills.filter((s) => filter in s.targets);
+
+  // Bundle source lookup + grouping of bundle-managed sub-skills.
+  const sourceById = new Map(sources.map((s) => [s.id, s] as const));
+  type BundleGroup = { source: SkillSource; skills: InstalledSkill[] };
+  const bundleGroups: BundleGroup[] = [];
+  const bundleGroupMap = new Map<string, BundleGroup>();
+  const nonBundleVisibleSkills: InstalledSkill[] = [];
+  for (const skill of visibleSkills) {
+    const src = sourceById.get(skill.sourceId);
+    if (src?.type === 'bundle') {
+      let g = bundleGroupMap.get(src.id);
+      if (!g) {
+        g = { source: src, skills: [] };
+        bundleGroupMap.set(src.id, g);
+        bundleGroups.push(g);
+      }
+      g.skills.push(skill);
+    } else {
+      nonBundleVisibleSkills.push(skill);
+    }
+  }
+  // Stable order: bundle groups by source name; sub-skills by name.
+  bundleGroups.sort((a, b) => a.source.name.localeCompare(b.source.name));
+  for (const g of bundleGroups) g.skills.sort((a, b) => a.name.localeCompare(b.name));
 
   const filterTabs: Array<{ id: FilterTarget; label: string; count: number }> = [
     { id: 'all', label: t('全部'), count: skills.length + discovered.length },
@@ -211,6 +285,117 @@ export function InstalledSkillsTab() {
         })}
       </div>
 
+      {bundleGroups.length > 0 && (
+        <div className="flex flex-col gap-2 mb-3">
+          {bundleGroups.map((group) => {
+            const expanded = expandedBundles.has(group.source.id);
+            const managedCount = group.skills.filter((s) =>
+              Object.values(s.targets).some((t) => t?.status === 'bundle-managed')
+            ).length;
+            const missingCount = group.skills.length - managedCount;
+            const syncing = syncingBundleId === group.source.id;
+            return (
+              <div
+                key={`bundle::${group.source.id}`}
+                className="rounded-lg border bg-card overflow-hidden"
+              >
+                <div className="flex items-center gap-2 px-3 py-2 hover:bg-accent/30">
+                  <button
+                    type="button"
+                    onClick={() => toggleBundleExpanded(group.source.id)}
+                    className="flex items-center gap-2 flex-1 min-w-0 text-left"
+                  >
+                    {expanded ? (
+                      <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                    )}
+                    <Package className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-sm font-medium truncate">{group.source.name}</span>
+                        <span
+                          className="inline-flex items-center rounded-full px-1.5 py-0 text-[10px] border bg-sky-500/10 text-sky-600 border-sky-500/30"
+                          title={t('由第三方安装器管理')}
+                        >
+                          {t('Bundle')} · {group.source.bundleManager ?? 'git'}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground">
+                        {group.skills.length} {t('个 sub-skill')}
+                        {managedCount > 0 && (
+                          <span className="ml-2 text-emerald-600">
+                            🟢 {managedCount} {t('managed')}
+                          </span>
+                        )}
+                        {missingCount > 0 && (
+                          <span className="ml-2 text-rose-600">
+                            🔴 {missingCount} {t('待修复')}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => handleSyncBundle(group.source.id)}
+                    disabled={syncing}
+                    title={t('Sync bundle')}
+                  >
+                    {syncing ? (
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3 mr-1" />
+                    )}
+                    {t('Sync')}
+                  </Button>
+                </div>
+                {expanded && (
+                  <div className="border-t bg-background/40">
+                    {group.skills.map((skill) => {
+                      const target = (Object.keys(skill.targets) as SkillTarget[])[0];
+                      const state = target ? skill.targets[target] : undefined;
+                      const status: SkillTargetStatus = state?.status ?? 'missing';
+                      return (
+                        <div
+                          key={skill.id}
+                          className="flex items-center gap-2 px-3 py-1.5 border-b last:border-b-0 text-xs hover:bg-accent/30"
+                        >
+                          <Wand2 className="h-3 w-3 text-muted-foreground shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <div className="font-medium truncate">{skill.name}</div>
+                            {skill.description && (
+                              <div className="text-muted-foreground truncate text-[11px]">
+                                {skill.description}
+                              </div>
+                            )}
+                          </div>
+                          <span
+                            className={cn(
+                              'inline-flex items-center rounded-full px-1.5 py-0 text-[10px] border shrink-0',
+                              STATUS_COLORS[status]
+                            )}
+                            title={target ? `${TARGET_LABELS[target]} · ${status}` : status}
+                          >
+                            {status}
+                          </span>
+                          <Switch
+                            checked={skill.enabled}
+                            onCheckedChange={(checked) => handleToggleEnabled(skill.id, checked)}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 pb-2">
         {visibleDiscovered.map((d) => (
           <NativeSkillCard
@@ -220,7 +405,7 @@ export function InstalledSkillsTab() {
             onChanged={reload}
           />
         ))}
-        {visibleSkills.map((skill) => (
+        {nonBundleVisibleSkills.map((skill) => (
           <div
             key={skill.id}
             className="flex flex-col gap-3 rounded-lg border bg-card p-4 hover:bg-accent/30 transition-colors"
@@ -308,7 +493,11 @@ export function InstalledSkillsTab() {
                   className="text-destructive hover:text-destructive"
                   onClick={() => handleUninstall(skill.id)}
                   disabled={uninstallingId === skill.id}
-                  title={t('Uninstall')}
+                  title={
+                    isBundleManaged(skill)
+                      ? t('从 EnsoAI 移除 (wrapper 仍由 bundle 安装器维护)')
+                      : t('Uninstall')
+                  }
                 >
                   {uninstallingId === skill.id ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />

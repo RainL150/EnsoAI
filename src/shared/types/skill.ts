@@ -8,13 +8,21 @@
 // status so we can detect: managed / modified / missing / wrong-symlink.
 
 export type SkillTarget = 'claude' | 'codex';
-export type SkillSourceType = 'git' | 'local' | 'native';
-export type SkillInstallMode = 'symlink' | 'copy';
-export type SkillTargetStatus = 'managed' | 'modified' | 'missing' | 'wrong-symlink';
+export type SkillSourceType = 'git' | 'local' | 'native' | 'bundle';
+export type SkillInstallMode = 'symlink' | 'copy' | 'bundle-wrapper';
+export type SkillTargetStatus =
+  | 'managed'
+  | 'modified'
+  | 'missing'
+  | 'wrong-symlink'
+  | 'bundle-managed';
 
 /** Sentinel ids for the auto-managed native sources (M10). */
 export const CLAUDE_NATIVE_SOURCE_ID = 'claude-native';
 export const CODEX_NATIVE_SOURCE_ID = 'codex-native';
+
+/** Known third-party bundle installers we can sync via their own CLI. */
+export type SkillBundleManager = 'gstack' | 'git' | 'unknown';
 
 export interface SkillSource {
   /** Stable generated id, e.g. `src_<uuid>`. */
@@ -38,6 +46,12 @@ export interface SkillSource {
   // Native-type source (M10)
   /** Required when type='native'. Which provider this source surfaces. */
   nativeTarget?: SkillTarget;
+
+  // Bundle-type source (M12) — third-party multi-skill installer (e.g. gstack)
+  /** Required when type='bundle'. Absolute path to the bundle root (one git repo). */
+  bundleRoot?: string;
+  /** Detected installer kind; drives the Sync command. */
+  bundleManager?: SkillBundleManager;
 
   enabled: boolean;
   lastRefreshAt?: string;
@@ -94,6 +108,12 @@ export interface SkillTargetState {
   installedAt: string;
   /** For mode='copy', hash of the copied content used to detect drift. */
   installedHash?: string;
+  /**
+   * For mode='bundle-wrapper': id of the bundle SkillSource that owns the
+   * underlying content on disk. The wrapper at `path` is maintained by the
+   * bundle's own installer (e.g. gstack setup), not by us.
+   */
+  managedBy?: string;
 }
 
 /**
@@ -132,6 +152,19 @@ export interface AddSkillSourceRequest {
   branch?: string;
   sourceDir?: string;
   localPath?: string;
+  /** Required when type='bundle'. */
+  bundleRoot?: string;
+  /** Optional override for bundle type; auto-detected when omitted. */
+  bundleManager?: SkillBundleManager;
+}
+
+export interface RemoveSourceCascadeOptions {
+  /**
+   * For type='bundle' only. When true, the bundle root directory itself is
+   * removed from disk after the lock entries are cleared. Defaults to false —
+   * the bundle stays installed and is just dropped from EnsoAI's view.
+   */
+  purgeBundleRoot?: boolean;
 }
 
 export interface InstallSkillRequest {

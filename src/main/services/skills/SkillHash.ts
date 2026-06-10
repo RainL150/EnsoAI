@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.vscode', '.idea', '__pycache__']);
+const EXCLUDED_DIRS = new Set(['.git', 'node_modules', 'dist', '.vscode', '.idea', '__pycache__']);
 const EXCLUDED_FILES = new Set(['.DS_Store', 'Thumbs.db']);
 
 async function listFilesRec(root: string, rel = ''): Promise<string[]> {

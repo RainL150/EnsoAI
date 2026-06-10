@@ -257,6 +257,7 @@ export const IPC_CHANNELS = {
   SKILLS_PROMOTE_DISCOVERED: 'skills:promoteDiscovered',
   SKILLS_DELETE_NATIVE: 'skills:deleteNative',
   SKILLS_UNPROMOTE: 'skills:unpromote',
+  SKILLS_SYNC_BUNDLE: 'skills:syncBundle',
   SKILLS_CHANGED: 'skills:changed',
   SKILLS_UPDATES_AVAILABLE: 'skills:updatesAvailable',
 

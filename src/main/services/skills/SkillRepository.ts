@@ -42,6 +42,20 @@ async function resolveScanRoot(source: SkillSource): Promise<string> {
   throw makeError('EINVAL', `Unknown source type: ${source.type}`);
 }
 
+/** Sub-dir names that should never count as a bundle sub-skill. */
+const BUNDLE_SKIP_DIRS = new Set([
+  '.git',
+  'node_modules',
+  'dist',
+  'build',
+  'scripts',
+  'bin',
+  'spec',
+  'template',
+  'fixtures',
+  '__pycache__',
+]);
+
 /** ~/.ensoai/sources/<sourceId>/ — where git clones live. */
 function getGitCacheDir(source: SkillSource): string {
   return path.join(getSourcesCacheRoot(), source.id);
@@ -171,6 +185,9 @@ async function readSkillMd(dir: string): Promise<string | null> {
 export async function scanSource(source: SkillSource): Promise<ScanResult> {
   if (source.type === 'native') {
     return scanNativeSource(source);
+  }
+  if (source.type === 'bundle') {
+    return scanBundleSource(source);
   }
 
   const warnings: string[] = [];
@@ -325,6 +342,82 @@ async function scanNativeSource(source: SkillSource): Promise<ScanResult> {
         nativeProviderPath: fullPath,
       });
     }
+  }
+
+  return { skills, warnings };
+}
+
+/**
+ * Scan a type='bundle' source — a third-party multi-skill installer like
+ * gstack. Each first-level subdirectory of `bundleRoot` that contains a
+ * SKILL.md becomes one AvailableSkill. The bundle's own umbrella SKILL.md
+ * at `bundleRoot/SKILL.md` is intentionally NOT enumerated — the bundle
+ * source itself represents the umbrella, and its wrapper at the provider
+ * dir IS the bundleRoot (so installing it would mean linking bundleRoot to
+ * itself, which is meaningless).
+ *
+ * The `name` for each sub-skill matches the wrapper-naming convention used
+ * by the installer: SKILL.md frontmatter `name` if present, else dir name.
+ * This is what the bundle's own installer (e.g. gstack setup) uses to pick
+ * the wrapper path under the provider dir.
+ */
+async function scanBundleSource(source: SkillSource): Promise<ScanResult> {
+  const warnings: string[] = [];
+  if (!source.bundleRoot) {
+    return { skills: [], warnings: ['bundle source missing bundleRoot'] };
+  }
+  const bundleRoot = source.bundleRoot;
+  if (!(await dirExists(bundleRoot))) {
+    return { skills: [], warnings: [`bundleRoot does not exist: ${bundleRoot}`] };
+  }
+
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(bundleRoot, { withFileTypes: true });
+  } catch (err) {
+    return { skills: [], warnings: [`readdir bundleRoot failed: ${(err as Error).message}`] };
+  }
+
+  const skills: AvailableSkill[] = [];
+  const seenNames = new Set<string>();
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+    if (BUNDLE_SKIP_DIRS.has(entry.name)) continue;
+    if (!entry.isDirectory()) continue;
+
+    const subDir = path.join(bundleRoot, entry.name);
+    const content = await readSkillMd(subDir);
+    if (!content) continue;
+
+    const meta = parseSkillFrontMatter(content);
+    const skillName = meta?.name?.trim() || entry.name;
+    if (seenNames.has(skillName)) {
+      warnings.push(`bundle ${source.name}: duplicate skill name "${skillName}" — skipping`);
+      continue;
+    }
+    if (!meta?.description) {
+      warnings.push(`bundle ${source.name}: ${entry.name}/SKILL.md missing description — skipping`);
+      continue;
+    }
+
+    let contentHash: string;
+    try {
+      contentHash = await hashDir(subDir);
+    } catch (err) {
+      warnings.push(`bundle ${source.name}: hash ${entry.name} failed (${(err as Error).message})`);
+      continue;
+    }
+
+    seenNames.add(skillName);
+    skills.push({
+      sourceId: source.id,
+      name: skillName,
+      description: meta.description,
+      version: meta.version,
+      contentPath: subDir,
+      contentHash,
+      installed: false,
+    });
   }
 
   return { skills, warnings };

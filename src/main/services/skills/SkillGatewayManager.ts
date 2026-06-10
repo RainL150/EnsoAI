@@ -11,7 +11,10 @@ import type {
   InstallSkillRequest,
   MirrorDiscoveredRequest,
   PromoteDiscoveredRequest,
+  RemoveSourceCascadeOptions,
+  SkillBundleManager,
   SkillInstallMode,
+  SkillSource,
   SkillTarget,
   UninstallSkillOptions,
   UnpromoteRequest,
@@ -19,8 +22,9 @@ import type {
 } from '@shared/types';
 import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { shell } from 'electron';
+import { execInPty } from '../../utils/shell';
 import { copyDir, linkOrCopy, readlinkAbsolute, unlinkSafe } from './linker';
-import { getProvider } from './providers';
+import { getAllProviders, getProvider } from './providers';
 import { findDiscovered, listAllDiscovered } from './SkillDiscovery';
 import {
   checkTargetStatus,
@@ -30,6 +34,7 @@ import {
 } from './SkillInstaller';
 import {
   ensureLayout,
+  generateSourceId,
   getCanonicalContentRoot,
   getSourcesCacheRoot,
   readLock,
@@ -51,6 +56,25 @@ function makeError(code: string, message: string): NodeJS.ErrnoException {
 
 function composeSkillId(sourceId: string, name: string): string {
   return `${sourceId}::${name}`;
+}
+
+/**
+ * Resolve install options for a (skill, target). For bundle sources we always
+ * force mode='bundle-wrapper' and inject managedBy so installToTarget can wire
+ * the wrapper-managed state correctly.
+ */
+function resolveInstallOptions(
+  source: SkillSource | undefined,
+  fallbackMode: SkillInstallMode
+): { mode: SkillInstallMode; managedBy?: string } {
+  if (source?.type === 'bundle') {
+    return { mode: 'bundle-wrapper', managedBy: source.id };
+  }
+  return { mode: fallbackMode };
+}
+
+function findSource(lock: { sources: SkillSource[] }, sourceId: string): SkillSource | undefined {
+  return lock.sources.find((s) => s.id === sourceId);
 }
 
 export class SkillGatewayManager {
@@ -77,6 +101,9 @@ export class SkillGatewayManager {
   async init(): Promise<void> {
     await ensureLayout();
     await this.ensureNativeSources();
+    await this.ensureBundleSources().catch((err) => {
+      console.warn('[SkillGateway] bundle source detection failed:', err);
+    });
     try {
       const result = await migrateV1IfNeeded();
       if (result.migrated) {
@@ -167,6 +194,164 @@ export class SkillGatewayManager {
     }
   }
 
+  /**
+   * Auto-detect bundle installers via the universal "shim pattern":
+   *   A bundle root is any directory into which two or more sibling wrappers
+   *   under the same provider dir point via their SKILL.md file-symlink.
+   *
+   * Examples that match:
+   *   ~/.claude/skills/browse/SKILL.md  → ~/.claude/skills/gstack/browse/SKILL.md
+   *   ~/.claude/skills/qa/SKILL.md      → ~/.claude/skills/gstack/qa/SKILL.md
+   *     → both wrappers grandparent-resolve to ~/.claude/skills/gstack → that's a bundle root
+   *
+   * No vendor signature is required for detection. gstack-/git-specific knobs
+   * only affect the Sync action (which CLI to invoke), not whether a bundle is
+   * recognized.
+   *
+   * After detection, all of the bundle's sub-skills are auto-tracked into the
+   * lock as `bundle-wrapper` rows; a re-run diffs against the current scan
+   * (new wrappers get pushed, vanished wrappers get pruned).
+   */
+  private async ensureBundleSources(): Promise<void> {
+    const lock = await readLock();
+    const now = new Date().toISOString();
+
+    // 1) Detect bundle roots via shim pattern, per provider.
+    const detected: Array<{
+      root: string;
+      nativeTarget: SkillTarget;
+    }> = [];
+    for (const provider of getAllProviders()) {
+      const roots = await detectBundleRootsByShim(provider.getSkillsDir());
+      for (const root of roots) {
+        detected.push({ root, nativeTarget: provider.target });
+      }
+    }
+
+    // 2) Ensure a SkillSource exists for each detected root (idempotent).
+    let mutated = false;
+    for (const { root, nativeTarget } of detected) {
+      const rootAbs = path.resolve(root);
+      let source = lock.sources.find(
+        (s) => s.type === 'bundle' && s.bundleRoot && path.resolve(s.bundleRoot) === rootAbs
+      );
+      if (!source) {
+        const manager = await sniffBundleManager(root);
+        const remoteUrl = await readGitRemoteUrl(root);
+        source = {
+          id: generateSourceId(),
+          type: 'bundle',
+          name: path.basename(root),
+          bundleRoot: root,
+          bundleManager: manager,
+          nativeTarget,
+          repoUrl: remoteUrl,
+          enabled: true,
+          createdAt: now,
+          updatedAt: now,
+        };
+        lock.sources.push(source);
+        mutated = true;
+      } else if (source.nativeTarget !== nativeTarget) {
+        // Bundle moved providers (unusual). Refresh attribution so install paths work.
+        source.nativeTarget = nativeTarget;
+        source.updatedAt = now;
+        mutated = true;
+      }
+
+      // 3) Auto-track sub-skills: scan + diff against lock.
+      const { skills: available } = await scanSource(source);
+      const currentNames = new Set(available.map((a) => a.name));
+
+      for (const sub of available) {
+        const wrapperPath = getTargetPath(nativeTarget, sub.name);
+
+        // Find any existing lock entry pointing at this wrapper (under any
+        // source — could be a native sentinel from old promote flow).
+        const existing = lock.skills.find(
+          (s) => s.name === sub.name && s.targets[nativeTarget]?.path === wrapperPath
+        );
+
+        if (existing) {
+          // Re-key onto this bundle source if it isn't already.
+          if (existing.sourceId !== source.id) {
+            existing.sourceId = source.id;
+            existing.id = composeSkillId(source.id, sub.name);
+            mutated = true;
+          }
+          // Refresh content metadata + target state.
+          existing.contentPath = sub.contentPath;
+          existing.contentHash = sub.contentHash;
+          if (sub.description !== undefined) existing.description = sub.description;
+          if (sub.version !== undefined) existing.version = sub.version;
+          const state = existing.targets[nativeTarget];
+          if (state) {
+            state.mode = 'bundle-wrapper';
+            state.managedBy = source.id;
+            state.path = wrapperPath;
+            state.status = await checkTargetStatus(existing, state);
+          } else {
+            existing.targets[nativeTarget] = {
+              mode: 'bundle-wrapper',
+              path: wrapperPath,
+              status: await checkTargetStatus(existing, {
+                mode: 'bundle-wrapper',
+                path: wrapperPath,
+                status: 'missing',
+                installedAt: now,
+                managedBy: source.id,
+              }),
+              installedAt: now,
+              managedBy: source.id,
+            };
+          }
+          existing.updatedAt = now;
+          mutated = true;
+        } else {
+          // Push fresh InstalledSkill row.
+          const skill: InstalledSkill = {
+            id: composeSkillId(source.id, sub.name),
+            sourceId: source.id,
+            name: sub.name,
+            description: sub.description,
+            version: sub.version,
+            contentPath: sub.contentPath,
+            contentHash: sub.contentHash,
+            targets: {
+              [nativeTarget]: {
+                mode: 'bundle-wrapper',
+                path: wrapperPath,
+                status: 'missing',
+                installedAt: now,
+                managedBy: source.id,
+              },
+            },
+            enabled: true,
+            installedAt: now,
+            updatedAt: now,
+          };
+          const state = skill.targets[nativeTarget];
+          if (state) state.status = await checkTargetStatus(skill, state);
+          lock.skills.push(skill);
+          mutated = true;
+        }
+      }
+
+      // 4) Prune sub-skills that vanished from the bundle since last scan.
+      const before = lock.skills.length;
+      lock.skills = lock.skills.filter((s) => {
+        if (s.sourceId !== source!.id) return true;
+        return currentNames.has(s.name);
+      });
+      if (lock.skills.length !== before) mutated = true;
+    }
+
+    if (mutated) {
+      await writeLock(lock);
+      this.notify(lock.skills);
+    }
+  }
+
   // ---------- Read ops (no queue needed) ----------
 
   async listInstalled(): Promise<InstalledSkill[]> {
@@ -180,9 +365,11 @@ export class SkillGatewayManager {
    */
   async browse(sourceId?: string): Promise<AvailableSkill[]> {
     const lock = await readLock();
+    // Bundle sources are auto-tracked; their sub-skills already appear in
+    // InstalledTab. Exposing them in Browse would duplicate the rows.
     const sources = sourceId
-      ? lock.sources.filter((s) => s.id === sourceId)
-      : lock.sources.filter((s) => s.enabled);
+      ? lock.sources.filter((s) => s.id === sourceId && s.type !== 'bundle')
+      : lock.sources.filter((s) => s.enabled && s.type !== 'bundle');
 
     const installedKeys = new Set(lock.skills.map((s) => s.id));
     const out: AvailableSkill[] = [];
@@ -319,9 +506,14 @@ export class SkillGatewayManager {
         updatedAt: now,
       };
 
+      const isBundle = source.type === 'bundle';
       for (const [tgt, opts] of Object.entries(req.targets)) {
         if (!opts) continue;
-        const state = await installToTarget(skill, tgt as SkillTarget, { mode: opts.mode });
+        const mode: SkillInstallMode = isBundle ? 'bundle-wrapper' : opts.mode;
+        const state = await installToTarget(skill, tgt as SkillTarget, {
+          mode,
+          managedBy: isBundle ? source.id : undefined,
+        });
         skill.targets[tgt as SkillTarget] = state;
       }
 
@@ -338,6 +530,8 @@ export class SkillGatewayManager {
    * - Never touches skill.contentPath (it lives inside source-owned cache
    *   for 'git' sources, or inside the user's dev dir for 'local' sources).
    * - The lock entry is removed regardless of source type.
+   * - For bundle-wrapper targets, the on-disk wrapper is preserved (it's
+   *   owned by the bundle's own installer). EnsoAI only drops the lock row.
    */
   async uninstall(skillId: string, _options: UninstallSkillOptions = {}): Promise<void> {
     return this.writeQueue.run(async () => {
@@ -348,7 +542,10 @@ export class SkillGatewayManager {
       if (!skill) return;
 
       for (const target of Object.keys(skill.targets) as SkillTarget[]) {
-        await uninstallFromTarget(target, skill.name);
+        const state = skill.targets[target];
+        await uninstallFromTarget(target, skill.name, {
+          preserveFs: state?.mode === 'bundle-wrapper',
+        });
       }
 
       lock.skills.splice(idx, 1);
@@ -390,7 +587,8 @@ export class SkillGatewayManager {
         for (const target of Object.keys(skill.targets) as SkillTarget[]) {
           const state = skill.targets[target];
           if (!state) continue;
-          const next = await installToTarget(skill, target, { mode: state.mode });
+          const opts = resolveInstallOptions(source, state.mode);
+          const next = await installToTarget(skill, target, opts);
           skill.targets[target] = next;
         }
       }
@@ -408,17 +606,22 @@ export class SkillGatewayManager {
       if (!skill) throw makeError('ENOENT_SKILL', `Skill ${skillId} not found`);
       if (skill.enabled === enabled) return;
 
+      const source = findSource(lock, skill.sourceId);
+
       if (enabled) {
         for (const target of Object.keys(skill.targets) as SkillTarget[]) {
           const state = skill.targets[target];
           if (!state) continue;
-          const next = await installToTarget(skill, target, { mode: state.mode });
+          const opts = resolveInstallOptions(source, state.mode);
+          const next = await installToTarget(skill, target, opts);
           skill.targets[target] = next;
         }
       } else {
         for (const target of Object.keys(skill.targets) as SkillTarget[]) {
-          await uninstallFromTarget(target, skill.name);
           const state = skill.targets[target];
+          await uninstallFromTarget(target, skill.name, {
+            preserveFs: state?.mode === 'bundle-wrapper',
+          });
           if (state) state.status = 'missing';
         }
       }
@@ -439,13 +642,17 @@ export class SkillGatewayManager {
       const skill = lock.skills.find((s) => s.id === skillId);
       if (!skill) throw makeError('ENOENT_SKILL', `Skill ${skillId} not found`);
 
+      const source = findSource(lock, skill.sourceId);
       const before = new Set(Object.keys(skill.targets) as SkillTarget[]);
       const after = new Set(Object.keys(targets) as SkillTarget[]);
 
       // Drop removed targets
       for (const tgt of before) {
         if (!after.has(tgt)) {
-          await uninstallFromTarget(tgt, skill.name);
+          const state = skill.targets[tgt];
+          await uninstallFromTarget(tgt, skill.name, {
+            preserveFs: state?.mode === 'bundle-wrapper',
+          });
           delete skill.targets[tgt];
         }
       }
@@ -454,12 +661,14 @@ export class SkillGatewayManager {
       for (const tgt of after) {
         const opts = targets[tgt];
         if (!opts) continue;
+        const resolved = resolveInstallOptions(source, opts.mode);
         if (skill.enabled) {
-          const state = await installToTarget(skill, tgt, { mode: opts.mode });
+          const state = await installToTarget(skill, tgt, resolved);
           skill.targets[tgt] = state;
         } else {
           skill.targets[tgt] = {
-            mode: opts.mode,
+            mode: resolved.mode,
+            managedBy: resolved.managedBy,
             path: getTargetPath(tgt, skill.name),
             status: 'missing',
             installedAt: new Date().toISOString(),
@@ -768,8 +977,15 @@ export class SkillGatewayManager {
    * Cleans canonical content (for promoted local sources whose localPath sits
    * under ~/.ensoai/canonical/) and the git clone cache (for git sources).
    * Native sources are immutable — refuses.
+   *
+   * For bundle sources, the bundleRoot stays on disk by default (it's owned
+   * by the bundle's own installer). Pass options.purgeBundleRoot=true to also
+   * trash the bundleRoot.
    */
-  async removeSourceCascade(sourceId: string): Promise<void> {
+  async removeSourceCascade(
+    sourceId: string,
+    options: RemoveSourceCascadeOptions = {}
+  ): Promise<void> {
     return this.writeQueue.run(async () => {
       const lock = await readLock();
       const source = lock.sources.find((s) => s.id === sourceId);
@@ -783,7 +999,10 @@ export class SkillGatewayManager {
       const dependents = lock.skills.filter((s) => s.sourceId === sourceId);
       for (const skill of dependents) {
         for (const target of Object.keys(skill.targets) as SkillTarget[]) {
-          await uninstallFromTarget(target, skill.name);
+          const state = skill.targets[target];
+          await uninstallFromTarget(target, skill.name, {
+            preserveFs: state?.mode === 'bundle-wrapper',
+          });
         }
       }
       lock.skills = lock.skills.filter((s) => s.sourceId !== sourceId);
@@ -803,8 +1022,79 @@ export class SkillGatewayManager {
         const cloneDir = path.join(getSourcesCacheRoot(), sourceId);
         await fs.promises.rm(cloneDir, { recursive: true, force: true }).catch(() => {});
       }
+      if (source.type === 'bundle' && options.purgeBundleRoot && source.bundleRoot) {
+        try {
+          await shell.trashItem(source.bundleRoot);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            console.warn('[SkillGateway] purgeBundleRoot failed:', err);
+          }
+        }
+      }
 
       lock.sources = lock.sources.filter((s) => s.id !== sourceId);
+      await writeLock(lock);
+      this.notify(lock.skills);
+    });
+  }
+
+  /**
+   * Refresh a bundle source by invoking its native installer (gstack-update-check
+   * + setup for gstack; git fetch + reset for plain git bundles). After the
+   * fetch, refresh status for every dependent skill — the wrapper layout the
+   * bundle's installer just wrote may have changed.
+   */
+  async syncBundle(sourceId: string): Promise<void> {
+    return this.writeQueue.run(async () => {
+      const lock = await readLock();
+      const source = lock.sources.find((s) => s.id === sourceId);
+      if (!source) throw makeError('ENOENT_SOURCE', `Source ${sourceId} not found`);
+      if (source.type !== 'bundle') {
+        throw makeError('EINVAL', `Source ${sourceId} is not a bundle`);
+      }
+      if (!source.bundleRoot) {
+        throw makeError('EINVAL', `Source ${sourceId} missing bundleRoot`);
+      }
+      const root = source.bundleRoot;
+
+      if (source.bundleManager === 'gstack') {
+        const updateCheck = path.join(root, 'bin', 'gstack-update-check');
+        const out = await execInPty(`"${updateCheck}" --force`, { timeout: 60000 }).catch((err) => {
+          throw makeError('EBUNDLE_SYNC', `gstack-update-check failed: ${(err as Error).message}`);
+        });
+        const stdout = typeof out === 'string' ? out : ((out as { stdout?: string })?.stdout ?? '');
+        if (/UPGRADE_AVAILABLE/.test(stdout)) {
+          await execInPty(`"${path.join(root, 'setup')}"`, { timeout: 300000 }).catch((err) => {
+            throw makeError('EBUNDLE_SYNC', `gstack setup failed: ${(err as Error).message}`);
+          });
+        }
+      } else if (source.bundleManager === 'git') {
+        await execInPty(`git -C "${root}" pull --ff-only`, { timeout: 120000 }).catch((err) => {
+          throw makeError('EBUNDLE_SYNC', `git pull failed: ${(err as Error).message}`);
+        });
+      } else {
+        throw makeError('EUNSUPPORTED', `Bundle manager '${source.bundleManager}' not syncable`);
+      }
+
+      const now = new Date().toISOString();
+      source.lastRefreshAt = now;
+      source.lastSuccessAt = now;
+      source.lastError = undefined;
+      source.updatedAt = now;
+
+      // Re-probe wrapper status for every dependent skill — the bundle's
+      // installer just rewrote the wrappers, so 'wrong-symlink' may flip back
+      // to 'bundle-managed'.
+      for (const skill of lock.skills) {
+        if (skill.sourceId !== sourceId) continue;
+        for (const target of Object.keys(skill.targets) as SkillTarget[]) {
+          const state = skill.targets[target];
+          if (!state) continue;
+          state.status = await checkTargetStatus(skill, state);
+        }
+        skill.updatedAt = now;
+      }
+
       await writeLock(lock);
       this.notify(lock.skills);
     });
@@ -846,4 +1136,104 @@ export function getSkillGatewayManager(): SkillGatewayManager {
 
 export function _resetGatewayManagerForTests(): void {
   instance = null;
+}
+
+// ---------- Bundle detection helpers ----------
+
+/** ≥ this many wrappers pointing into one root makes it a bundle. */
+const MIN_SHIMS_FOR_BUNDLE = 2;
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await fs.promises.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect bundle roots under a provider skills dir using the universal shim
+ * pattern: a directory becomes a bundle root iff at least MIN_SHIMS_FOR_BUNDLE
+ * sibling wrappers under the same provider dir each have a SKILL.md
+ * file-symlink that resolves to a file inside that directory.
+ *
+ * Returns the absolute paths of detected bundle roots (deduplicated).
+ */
+async function detectBundleRootsByShim(providerDir: string): Promise<string[]> {
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(providerDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const grandparentCounts = new Map<string, number>();
+  const grandparentEntries = new Map<string, Set<string>>();
+
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+    // We need a real-dir wrapper containing a file-symlink SKILL.md.
+    // Directory-level symlinks aren't the shim pattern.
+    const entryPath = path.join(providerDir, entry.name);
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.lstat(entryPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+
+    const skillMd = path.join(entryPath, 'SKILL.md');
+    const skillMdAlt = path.join(entryPath, 'skill.md');
+    const linkTarget = (await readlinkAbsolute(skillMd)) ?? (await readlinkAbsolute(skillMdAlt));
+    if (!linkTarget) continue;
+
+    // Grandparent of the target file = bundleRoot.
+    //   <root>/<sub>/SKILL.md
+    //   ──────┘ this is what we want
+    const subDir = path.dirname(linkTarget);
+    const root = path.dirname(subDir);
+    // Defensive: ignore degenerate paths.
+    if (!root || root === '/' || root === '.') continue;
+    // Ignore wrappers whose link target lives under sourcesRoot / canonicalRoot —
+    // those are gateway-owned, not bundle-owned.
+    if (
+      root.startsWith(path.resolve(getSourcesCacheRoot()) + path.sep) ||
+      root.startsWith(path.resolve(getCanonicalContentRoot()) + path.sep)
+    ) {
+      continue;
+    }
+
+    const rootAbs = path.resolve(root);
+    grandparentCounts.set(rootAbs, (grandparentCounts.get(rootAbs) ?? 0) + 1);
+    const set = grandparentEntries.get(rootAbs) ?? new Set();
+    set.add(entry.name);
+    grandparentEntries.set(rootAbs, set);
+  }
+
+  const roots: string[] = [];
+  for (const [root, count] of grandparentCounts) {
+    if (count >= MIN_SHIMS_FOR_BUNDLE) roots.push(root);
+  }
+  return roots;
+}
+
+/** Pick a sync strategy based on what tooling exists at the bundle root. */
+async function sniffBundleManager(bundleRoot: string): Promise<SkillBundleManager> {
+  if (await pathExists(path.join(bundleRoot, 'bin', 'gstack-update-check'))) {
+    return 'gstack';
+  }
+  if (await pathExists(path.join(bundleRoot, '.git'))) return 'git';
+  return 'unknown';
+}
+
+async function readGitRemoteUrl(bundleRoot: string): Promise<string | undefined> {
+  try {
+    const cfg = await fs.promises.readFile(path.join(bundleRoot, '.git', 'config'), 'utf-8');
+    const m = cfg.match(/\[remote "origin"\][^[]*url\s*=\s*(\S+)/);
+    return m?.[1];
+  } catch {
+    return undefined;
+  }
 }

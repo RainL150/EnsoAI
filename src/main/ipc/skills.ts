@@ -10,6 +10,7 @@ import {
   IPC_CHANNELS,
   type MirrorDiscoveredRequest,
   type PromoteDiscoveredRequest,
+  type RemoveSourceCascadeOptions,
   type SkillInstallMode,
   type SkillSource,
   type SkillTarget,
@@ -57,8 +58,8 @@ export function registerSkillsHandlers(): void {
 
   ipcMain.handle(
     IPC_CHANNELS.SKILLS_SOURCES_REMOVE_CASCADE,
-    async (_event, id: string): Promise<void> => {
-      await gateway.removeSourceCascade(id);
+    async (_event, id: string, options?: RemoveSourceCascadeOptions): Promise<void> => {
+      await gateway.removeSourceCascade(id, options);
     }
   );
 
@@ -174,6 +175,13 @@ export function registerSkillsHandlers(): void {
     IPC_CHANNELS.SKILLS_UNPROMOTE,
     async (_event, req: UnpromoteRequest): Promise<void> => {
       await gateway.unpromote(req);
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.SKILLS_SYNC_BUNDLE,
+    async (_event, sourceId: string): Promise<void> => {
+      await gateway.syncBundle(sourceId);
     }
   );
 }

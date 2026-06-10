@@ -1,5 +1,5 @@
 import type { AvailableSkill, SkillSource } from '@shared/types';
-import { Check, Cloud, Loader2, Lock, RefreshCw } from 'lucide-react';
+import { Check, Cloud, Loader2, Lock, Package, RefreshCw } from 'lucide-react';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
 import { toastManager } from '@/components/ui/toast';
@@ -17,6 +17,7 @@ export function BrowseSkillsTab() {
   const [refreshing, setRefreshing] = React.useState(false);
   const [installTarget, setInstallTarget] = React.useState<AvailableSkill | null>(null);
   const [promotingKey, setPromotingKey] = React.useState<string | null>(null);
+  const [installingKey, setInstallingKey] = React.useState<string | null>(null);
   const [selectedSourceId, setSelectedSourceId] = React.useState<string>(ALL_SOURCES_VALUE);
 
   const refresh = React.useCallback(async () => {
@@ -67,12 +68,32 @@ export function BrowseSkillsTab() {
         origin: source.nativeTarget,
         name: skill.name,
       });
-      toastManager.add({ type: 'success', title: t('已接管') + `: ${skill.name}` });
+      toastManager.add({ type: 'success', title: `${t('已接管')}: ${skill.name}` });
       await refresh();
     } catch (err) {
       toastManager.add({ type: 'error', title: (err as Error).message });
     } finally {
       setPromotingKey(null);
+    }
+  };
+
+  const handleInstallBundle = async (skill: AvailableSkill) => {
+    const source = sourceById.get(skill.sourceId);
+    if (!source || source.type !== 'bundle' || !source.nativeTarget) return;
+    const key = `${skill.sourceId}::${skill.name}`;
+    setInstallingKey(key);
+    try {
+      await window.electronAPI.skills.install({
+        sourceId: skill.sourceId,
+        name: skill.name,
+        targets: { [source.nativeTarget]: { mode: 'bundle-wrapper' } },
+      });
+      toastManager.add({ type: 'success', title: `${t('已纳管')}: ${skill.name}` });
+      await refresh();
+    } catch (err) {
+      toastManager.add({ type: 'error', title: (err as Error).message });
+    } finally {
+      setInstallingKey(null);
     }
   };
 
@@ -85,7 +106,9 @@ export function BrowseSkillsTab() {
     );
   }
 
-  const visibleSources = sources.filter((s) => s.enabled);
+  // Bundle sources are auto-tracked; they live on the Installed tab as a
+  // collapsible group. Don't list them in Browse — would duplicate the rows.
+  const visibleSources = sources.filter((s) => s.enabled && s.type !== 'bundle');
 
   return (
     <div className="space-y-3 pb-2">
@@ -127,13 +150,17 @@ export function BrowseSkillsTab() {
           {filtered.map((skill) => {
             const source = sourceById.get(skill.sourceId);
             const isNative = source?.type === 'native';
+            const isBundle = source?.type === 'bundle';
             const isTakenOver = !!skill.takenOver;
             const key = `${skill.sourceId}::${skill.name}`;
             const promoting = promotingKey === key;
+            const installingBundle = installingKey === key;
             return (
               <div key={key} className="flex flex-col gap-2 rounded-lg border bg-card p-4">
                 <div className="flex items-start gap-2">
-                  {isNative ? (
+                  {isBundle ? (
+                    <Package className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+                  ) : isNative ? (
                     <Lock className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
                   ) : (
                     <Cloud className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
@@ -141,6 +168,14 @@ export function BrowseSkillsTab() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span className="text-sm font-medium truncate">{skill.name}</span>
+                      {isBundle && (
+                        <span
+                          className="inline-flex items-center rounded-full px-1.5 py-0 text-[10px] border bg-sky-500/10 text-sky-600 border-sky-500/30"
+                          title={t('由第三方安装器管理')}
+                        >
+                          {t('Bundle')} · {source?.bundleManager ?? 'git'}
+                        </span>
+                      )}
                       {isNative && (
                         <span
                           className={cn(
@@ -163,7 +198,24 @@ export function BrowseSkillsTab() {
                   <span className="text-[11px] text-muted-foreground truncate flex-1">
                     {source?.name ?? skill.sourceId}
                   </span>
-                  {isNative ? (
+                  {isBundle ? (
+                    skill.installed ? (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-600 border border-emerald-500/30 px-2.5 py-0.5 text-xs">
+                        <Check className="h-3 w-3" />
+                        {t('已纳管')}
+                      </span>
+                    ) : (
+                      <Button
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => handleInstallBundle(skill)}
+                        disabled={installingBundle}
+                      >
+                        {installingBundle && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}
+                        {t('纳管')}
+                      </Button>
+                    )
+                  ) : isNative ? (
                     isTakenOver ? (
                       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-600 border border-emerald-500/30 px-2.5 py-0.5 text-xs">
                         <Check className="h-3 w-3" />

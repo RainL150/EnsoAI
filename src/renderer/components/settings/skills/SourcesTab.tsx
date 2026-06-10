@@ -1,5 +1,17 @@
 import type { SkillSource } from '@shared/types';
-import { AlertTriangle, Boxes, Folder, GitBranch, Loader2, Lock, Plus, Trash2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  Boxes,
+  Folder,
+  FolderOpen,
+  GitBranch,
+  Loader2,
+  Lock,
+  Package,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
 import * as React from 'react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogPopup, DialogTitle } from '@/components/ui/dialog';
@@ -14,11 +26,13 @@ export function SourcesTab() {
   const [loading, setLoading] = React.useState(true);
   const [addOpen, setAddOpen] = React.useState(false);
   const [removingId, setRemovingId] = React.useState<string | null>(null);
+  const [syncingId, setSyncingId] = React.useState<string | null>(null);
   const [cascadeTarget, setCascadeTarget] = React.useState<{
     source: SkillSource;
     dependentCount: number;
   } | null>(null);
   const [cascadeBusy, setCascadeBusy] = React.useState(false);
+  const [purgeBundleRoot, setPurgeBundleRoot] = React.useState(false);
 
   const reload = React.useCallback(async () => {
     try {
@@ -75,16 +89,41 @@ export function SourcesTab() {
     if (!cascadeTarget) return;
     setCascadeBusy(true);
     try {
-      await window.electronAPI.skills.sources.removeCascade(cascadeTarget.source.id);
+      await window.electronAPI.skills.sources.removeCascade(
+        cascadeTarget.source.id,
+        cascadeTarget.source.type === 'bundle' ? { purgeBundleRoot } : undefined
+      );
       toastManager.add({
         type: 'success',
         title: `${t('已删除来源及其')} ${cascadeTarget.dependentCount} ${t('个 skill')}`,
       });
       setCascadeTarget(null);
+      setPurgeBundleRoot(false);
     } catch (err) {
       toastManager.add({ type: 'error', title: (err as Error).message });
     } finally {
       setCascadeBusy(false);
+    }
+  };
+
+  const handleSyncBundle = async (id: string) => {
+    setSyncingId(id);
+    try {
+      await window.electronAPI.skills.syncBundle(id);
+      toastManager.add({ type: 'success', title: t('Bundle 已同步') });
+    } catch (err) {
+      toastManager.add({ type: 'error', title: (err as Error).message });
+    } finally {
+      setSyncingId(null);
+    }
+  };
+
+  const handleOpenBundle = async (source: SkillSource) => {
+    if (!source.bundleRoot) return;
+    try {
+      await window.electronAPI.shell.openPath(source.bundleRoot);
+    } catch (err) {
+      toastManager.add({ type: 'error', title: (err as Error).message });
     }
   };
 
@@ -115,6 +154,7 @@ export function SourcesTab() {
         <div className="space-y-2">
           {sources.map((source) => {
             const isNative = source.type === 'native';
+            const isBundle = source.type === 'bundle';
             return (
               <div
                 key={source.id}
@@ -122,6 +162,8 @@ export function SourcesTab() {
               >
                 {isNative ? (
                   <Lock className="h-4 w-4 shrink-0 text-muted-foreground" />
+                ) : isBundle ? (
+                  <Package className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : source.type === 'git' ? (
                   <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
                 ) : (
@@ -135,20 +177,57 @@ export function SourcesTab() {
                         {t('内置')}
                       </span>
                     )}
+                    {isBundle && (
+                      <span
+                        className="inline-flex items-center rounded-full px-1.5 py-0 text-[10px] border bg-sky-500/10 text-sky-600 border-sky-500/30"
+                        title={t('由第三方安装器管理 (如 gstack)')}
+                      >
+                        {t('Bundle')} · {source.bundleManager ?? 'git'}
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs text-muted-foreground truncate">
                     {isNative
                       ? source.nativeTarget === 'claude'
                         ? '~/.claude/skills'
                         : '~/.agents/skills'
-                      : source.type === 'git'
-                        ? `${source.repoUrl}${source.branch ? ` · ${source.branch}` : ''}${source.sourceDir && source.sourceDir !== '.' ? ` · ${source.sourceDir}` : ''}`
-                        : source.localPath}
+                      : isBundle
+                        ? source.bundleRoot
+                        : source.type === 'git'
+                          ? `${source.repoUrl}${source.branch ? ` · ${source.branch}` : ''}${source.sourceDir && source.sourceDir !== '.' ? ` · ${source.sourceDir}` : ''}`
+                          : source.localPath}
                     {source.lastError && (
                       <span className="text-destructive ml-2">⚠ {source.lastError}</span>
                     )}
                   </div>
                 </div>
+                {isBundle && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => handleSyncBundle(source.id)}
+                      disabled={syncingId === source.id}
+                      title={t('Sync bundle')}
+                    >
+                      {syncingId === source.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => handleOpenBundle(source)}
+                      title={t('Open folder')}
+                    >
+                      <FolderOpen className="h-3.5 w-3.5" />
+                    </Button>
+                  </>
+                )}
                 <Switch
                   checked={source.enabled}
                   onCheckedChange={(checked) => handleToggle(source.id, checked)}
@@ -187,7 +266,10 @@ export function SourcesTab() {
       <Dialog
         open={cascadeTarget !== null}
         onOpenChange={(v) => {
-          if (!v && !cascadeBusy) setCascadeTarget(null);
+          if (!v && !cascadeBusy) {
+            setCascadeTarget(null);
+            setPurgeBundleRoot(false);
+          }
         }}
       >
         <DialogPopup className="sm:max-w-md">
@@ -206,16 +288,40 @@ export function SourcesTab() {
             <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
               {cascadeTarget?.source.type === 'git'
                 ? t('git 来源的 ~/.ensoai/sources/ 缓存目录也会一并删除。')
-                : t(
-                    '若是 promoted real-dir 来源，~/.ensoai/canonical/ 下的内容会被删除；指向 dev 目录的 local 来源不动 dev 目录。'
-                  )}
+                : cascadeTarget?.source.type === 'bundle'
+                  ? t(
+                      'Bundle 来源的 wrapper 文件由其安装器 (如 gstack) 维护，默认不动；勾选下方选项才会把整个 bundle 目录扔到废纸篓。'
+                    )
+                  : t(
+                      '若是 promoted real-dir 来源，~/.ensoai/canonical/ 下的内容会被删除；指向 dev 目录的 local 来源不动 dev 目录。'
+                    )}
             </div>
+            {cascadeTarget?.source.type === 'bundle' && cascadeTarget.source.bundleRoot && (
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={purgeBundleRoot}
+                  onChange={(e) => setPurgeBundleRoot(e.target.checked)}
+                  disabled={cascadeBusy}
+                  className="mt-0.5"
+                />
+                <div className="text-xs">
+                  <div className="font-medium text-foreground">{t('同时删除 bundle 根目录')}</div>
+                  <div className="text-muted-foreground break-all">
+                    {cascadeTarget.source.bundleRoot}
+                  </div>
+                </div>
+              </label>
+            )}
           </div>
           <div className="flex justify-end gap-2 px-4 py-3 border-t">
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setCascadeTarget(null)}
+              onClick={() => {
+                setCascadeTarget(null);
+                setPurgeBundleRoot(false);
+              }}
               disabled={cascadeBusy}
             >
               {t('Cancel')}

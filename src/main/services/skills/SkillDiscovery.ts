@@ -26,10 +26,22 @@ async function isGatewayLink(linkPath: string, sourcesRoot: string): Promise<boo
   return resolved === normalized || resolved.startsWith(normalized + path.sep);
 }
 
+/** True if `p` equals any of the bundle roots or sits strictly inside one. */
+function isInsideBundleRoot(p: string, bundleRoots: string[]): boolean {
+  const resolved = path.resolve(p);
+  for (const root of bundleRoots) {
+    const r = path.resolve(root);
+    if (resolved === r) return true;
+    if (resolved.startsWith(r + path.sep)) return true;
+  }
+  return false;
+}
+
 async function scanProvider(
   target: SkillTarget,
   sourcesRoot: string,
-  excludeNames: Set<string>
+  excludeNames: Set<string>,
+  bundleRoots: string[]
 ): Promise<DiscoveredSkill[]> {
   const out: DiscoveredSkill[] = [];
   const seenNames = new Set<string>();
@@ -49,6 +61,8 @@ async function scanProvider(
       const fullPath = path.join(dir, entry.name);
 
       if (await isGatewayLink(fullPath, sourcesRoot)) continue;
+      // Bundle-claimed: entry IS a registered bundle root.
+      if (isInsideBundleRoot(fullPath, bundleRoots)) continue;
 
       let stat: fs.Stats;
       try {
@@ -83,6 +97,17 @@ async function scanProvider(
         continue;
       }
       if (!hasSkillMd) continue;
+
+      // Bundle-managed wrapper: real-dir whose SKILL.md is a file-symlink
+      // resolving into a registered bundle root (gstack's wrapper layout).
+      // These are owned by the bundle's installer — leave them alone.
+      if (kind === 'real-dir' && bundleRoots.length > 0) {
+        const skillMdReal = path.join(contentPath, 'SKILL.md');
+        const skillMdAlt = path.join(contentPath, 'skill.md');
+        const skillMdResolved =
+          (await readlinkAbsolute(skillMdReal)) ?? (await readlinkAbsolute(skillMdAlt));
+        if (skillMdResolved && isInsideBundleRoot(skillMdResolved, bundleRoots)) continue;
+      }
 
       let description: string | undefined;
       try {
@@ -137,9 +162,21 @@ export async function listAllDiscovered(): Promise<DiscoveredSkill[]> {
     }
   }
 
+  const bundleRoots: string[] = [];
+  for (const source of lock.sources) {
+    if (source.type === 'bundle' && source.bundleRoot) {
+      bundleRoots.push(source.bundleRoot);
+    }
+  }
+
   const out: DiscoveredSkill[] = [];
   for (const target of ALL_TARGETS) {
-    const items = await scanProvider(target, sourcesRoot, trackedByTarget.get(target) ?? new Set());
+    const items = await scanProvider(
+      target,
+      sourcesRoot,
+      trackedByTarget.get(target) ?? new Set(),
+      bundleRoots
+    );
     out.push(...items);
   }
   return out.sort((a, b) => a.name.localeCompare(b.name) || a.target.localeCompare(b.target));

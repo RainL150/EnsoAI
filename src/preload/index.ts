@@ -932,8 +932,11 @@ const electronAPI = {
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_ADD, req),
       remove: (id: string): Promise<void> =>
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE, id),
-      removeCascade: (id: string): Promise<void> =>
-        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE_CASCADE, id),
+      removeCascade: (
+        id: string,
+        options?: import('@shared/types').RemoveSourceCascadeOptions
+      ): Promise<void> =>
+        ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_REMOVE_CASCADE, id, options),
       setEnabled: (id: string, enabled: boolean): Promise<void> =>
         ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SOURCES_SET_ENABLED, id, enabled),
       update: (
@@ -998,6 +1001,8 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.SKILLS_DELETE_NATIVE, target, name, options),
     unpromote: (req: import('@shared/types').UnpromoteRequest): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.SKILLS_UNPROMOTE, req),
+    syncBundle: (sourceId: string): Promise<void> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SKILLS_SYNC_BUNDLE, sourceId),
     onChanged: (
       callback: (skills: import('@shared/types').InstalledSkill[]) => void
     ): (() => void) => {
