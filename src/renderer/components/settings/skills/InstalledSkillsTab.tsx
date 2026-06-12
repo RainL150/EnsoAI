@@ -370,7 +370,10 @@ export function InstalledSkillsTab() {
                           <div className="min-w-0 flex-1">
                             <div className="font-medium truncate">{skill.name}</div>
                             {skill.description && (
-                              <div className="text-muted-foreground truncate text-[11px]">
+                              <div
+                                className="text-muted-foreground truncate text-[11px]"
+                                title={skill.description}
+                              >
                                 {skill.description}
                               </div>
                             )}
@@ -409,7 +412,10 @@ export function InstalledSkillsTab() {
               <Wand2 className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium truncate">{skill.name}</div>
-                <p className="text-xs text-muted-foreground line-clamp-2 mt-0.5">
+                <p
+                  className="text-xs text-muted-foreground line-clamp-2 mt-0.5"
+                  title={skill.description || undefined}
+                >
                   {skill.description || t('(no description)')}
                 </p>
               </div>
