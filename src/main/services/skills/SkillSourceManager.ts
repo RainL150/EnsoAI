@@ -1,9 +1,11 @@
 // CRUD for SkillSource entries in the lock file.
 // Does NOT do git fetch / repo scanning — that lives in M3's SkillRepository.
 
+import * as fs from 'node:fs';
 import type { AddSkillSourceRequest, SkillSource } from '@shared/types';
 import { CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID } from '@shared/types';
 import { generateSourceId, readLock, writeLock } from './SkillLockStore';
+import { validateGitSource } from './SkillRepository';
 
 const NATIVE_SOURCE_IDS = new Set([CLAUDE_NATIVE_SOURCE_ID, CODEX_NATIVE_SOURCE_ID]);
 
@@ -51,6 +53,23 @@ export class SkillSourceManager {
       );
       if (duplicate) {
         throw makeError('EEXIST_SOURCE', `A local source for ${req.localPath} already exists`);
+      }
+    }
+
+    // Reachability check — refuse to persist a source we know is broken.
+    // git: probe via `git ls-remote` (fast, no clone).
+    // local: confirm the directory exists.
+    if (req.type === 'git') {
+      await validateGitSource(req.repoUrl!, req.branch);
+    } else if (req.type === 'local') {
+      try {
+        const stat = await fs.promises.stat(req.localPath!);
+        if (!stat.isDirectory()) {
+          throw makeError('ENOTDIR', `本地路径不是目录：${req.localPath}`);
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOTDIR') throw err;
+        throw makeError('ENOENT_PATH', `本地路径不存在或不可访问：${req.localPath}`);
       }
     }
 

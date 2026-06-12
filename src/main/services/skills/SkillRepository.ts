@@ -8,8 +8,10 @@
 // Scan walks at most 2 levels under <root>/<sourceDir> looking for SKILL.md
 // (case-insensitive). This matches qunar's policy and keeps perf bounded.
 
+import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { promisify } from 'node:util';
 import type { AvailableSkill, SkillSource } from '@shared/types';
 import { execInPty } from '../../utils/shell';
 import { parseSkillFrontMatter } from '../../utils/skillFrontmatter';
@@ -17,6 +19,8 @@ import { readlinkAbsolute } from './linker';
 import { getProvider } from './providers';
 import { hashDir } from './SkillHash';
 import { ensureLayout, getSourcesCacheRoot } from './SkillLockStore';
+
+const execFileAsync = promisify(execFile);
 
 export interface ScanResult {
   skills: AvailableSkill[];
@@ -86,6 +90,70 @@ function getDiscoveryDirs(source: SkillSource): string[] {
 }
 
 /**
+ * Probe a git repo + branch without writing anything to disk.
+ * Returns void on success; throws with a specific code on failure so the
+ * caller (SkillSourceManager.add) can surface a meaningful message.
+ *
+ * Uses execFile (not PTY) with GIT_TERMINAL_PROMPT=0 so private-repo auth
+ * prompts fail fast instead of hanging.
+ */
+export async function validateGitSource(repoUrl: string, branch?: string): Promise<void> {
+  if (!repoUrl?.trim()) throw makeError('EINVAL', 'repoUrl is required');
+  const ref = branch?.trim() || 'main';
+  let stdout = '';
+  let stderr = '';
+  try {
+    const result = await execFileAsync('git', ['ls-remote', '--heads', repoUrl, ref], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo' },
+      timeout: 30000,
+    });
+    stdout = result.stdout;
+    stderr = result.stderr;
+  } catch (err) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const msg = `${e.stderr ?? ''}\n${e.message ?? ''}`.toLowerCase();
+    if (
+      msg.includes('could not read username') ||
+      msg.includes('authentication failed') ||
+      msg.includes('terminal prompts disabled')
+    ) {
+      throw makeError('EAUTH_REQUIRED', `仓库需要认证（私有仓库或凭证缺失）：${repoUrl}`);
+    }
+    if (msg.includes('repository not found') || msg.includes('not found')) {
+      throw makeError('EREPO_NOT_FOUND', `仓库不存在或不可访问：${repoUrl}`);
+    }
+    if (msg.includes('could not resolve host')) {
+      throw makeError('ENETWORK', `网络不可达：${repoUrl}`);
+    }
+    throw makeError('EGIT_FAIL', `git 探测失败：${(e.stderr || e.message || '').trim()}`);
+  }
+  if (!stdout.trim()) {
+    throw makeError(
+      'EBRANCH_NOT_FOUND',
+      `分支 "${ref}" 不存在于仓库 ${repoUrl}（stderr: ${stderr.trim()}）`
+    );
+  }
+}
+
+/**
+ * Check whether an existing clone dir is healthy (HEAD is a real ref).
+ * A failed initial clone can leave a partial `.git/` with HEAD pointing to
+ * `refs/heads/.invalid`; we must not treat that as "already cloned".
+ */
+async function isCloneHealthy(cacheDir: string): Promise<boolean> {
+  if (!(await dirExists(path.join(cacheDir, '.git')))) return false;
+  try {
+    await execFileAsync('git', ['-C', cacheDir, 'rev-parse', '--verify', 'HEAD'], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      timeout: 10000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Clone if missing; otherwise fetch + hard reset to origin/<branch>.
  * Returns the absolute path to the clone dir.
  */
@@ -95,17 +163,17 @@ async function ensureGitClone(source: SkillSource): Promise<string> {
   const cacheDir = getGitCacheDir(source);
   const branch = source.branch?.trim() || 'main';
 
-  const alreadyCloned = await dirExists(path.join(cacheDir, '.git'));
-  if (!alreadyCloned) {
-    // Clean any stale partial dir
+  const healthy = await isCloneHealthy(cacheDir);
+  if (!healthy) {
+    // Clean any stale partial dir (broken HEAD, half-clone, leftover .git)
     await fs.promises.rm(cacheDir, { recursive: true, force: true }).catch(() => {});
-    const cmd = `git clone --depth 1 --branch "${branch}" "${source.repoUrl}" "${cacheDir}"`;
+    const cmd = `GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "${branch}" "${source.repoUrl}" "${cacheDir}"`;
     await execInPty(cmd, { timeout: 180000 });
     return cacheDir;
   }
 
   // Refresh existing clone
-  const fetchCmd = `cd "${cacheDir}" && git fetch --depth 1 origin "${branch}"`;
+  const fetchCmd = `cd "${cacheDir}" && GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "${branch}"`;
   await execInPty(fetchCmd, { timeout: 120000 });
   const resetCmd = `cd "${cacheDir}" && git reset --hard "origin/${branch}"`;
   await execInPty(resetCmd, { timeout: 30000 });
