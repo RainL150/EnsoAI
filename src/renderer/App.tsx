@@ -497,14 +497,7 @@ export default function App() {
   );
 
   useGroupSync(hideGroups, activeGroupId, setActiveGroupId, saveActiveGroupId);
-  useOpenPathListener({
-    repositories,
-    saveRepositories,
-    setSelectedRepo,
-    onSwitchWorktree: (path) => switchWorktreePathRef.current?.(path),
-    onSwitchTab: handleTabChange,
-    tempWorkspaces,
-  });
+  useOpenPathListener(repositories, saveRepositories, setSelectedRepo);
   useOpenContextListener({
     repositories,
     saveRepositories,

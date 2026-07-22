@@ -17,8 +17,8 @@ export function hasBundledConptyRuntime(
   fileExists: (file: string) => boolean = existsSync
 ): boolean {
   return (
-    fileExists(path.join(runtimeDir, 'conpty.dll')) &&
-    fileExists(path.join(runtimeDir, 'OpenConsole.exe'))
+    fileExists(path.win32.join(runtimeDir, 'conpty.dll')) &&
+    fileExists(path.win32.join(runtimeDir, 'OpenConsole.exe'))
   );
 }
 
