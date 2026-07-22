@@ -39,6 +39,7 @@ export const BUILTIN_AGENT_INFO: Record<BuiltinAgentId, { name: string; descript
   cursor: { name: 'Cursor', description: 'Cursor Agent CLI' },
   opencode: { name: 'OpenCode', description: 'OpenCode AI CLI' },
   pi: { name: 'Pi', description: 'Pi Coding Agent CLI' },
+  omp: { name: 'OMP', description: 'Oh My Pi Coding Agent CLI' },
 };
 
 export const BUILTIN_AGENTS: BuiltinAgentId[] = [
@@ -50,4 +51,5 @@ export const BUILTIN_AGENTS: BuiltinAgentId[] = [
   'cursor',
   'opencode',
   'pi',
+  'omp',
 ];

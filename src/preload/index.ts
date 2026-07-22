@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { release } from 'node:os';
 import 'electron-log/preload.js';
 import type { Locale } from '@shared/i18n';
 import type {
@@ -31,6 +32,7 @@ import type {
   MergeConflict,
   MergeConflictContent,
   MergeState,
+  OpenContext,
   ProxySettings,
   PullRequest,
   RecentEditorProject,
@@ -73,6 +75,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_CREATE, workdir, name, startPoint),
     checkout: (workdir: string, branch: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_CHECKOUT, workdir, branch),
+    getBranchHeadInfo: (
+      workdir: string,
+      branchName: string
+    ): Promise<import('@shared/types').BranchHeadInfo | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_HEAD_INFO, workdir, branchName),
     commit: (workdir: string, message: string, files?: string[]): Promise<string> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_COMMIT, workdir, message, files),
     push: (
@@ -454,6 +461,15 @@ const electronAPI = {
       ipcRenderer.on(IPC_CHANNELS.APP_OPEN_PATH, handler);
       return () => ipcRenderer.off(IPC_CHANNELS.APP_OPEN_PATH, handler);
     },
+    onOpenContext: (callback: (context: OpenContext) => void): (() => void) => {
+      const handler = (_: unknown, context: OpenContext) => callback(context);
+      ipcRenderer.on(IPC_CHANNELS.APP_OPEN_CONTEXT, handler);
+      return () => ipcRenderer.off(IPC_CHANNELS.APP_OPEN_CONTEXT, handler);
+    },
+    getPendingOpenContext: (): Promise<OpenContext | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.APP_GET_PENDING_OPEN_CONTEXT),
+    consumePendingOpenContext: (): Promise<OpenContext | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.APP_CONSUME_PENDING_OPEN_CONTEXT),
     onFocusSession: (callback: (params: { sessionId: string }) => void): (() => void) => {
       const handler = (_: unknown, params: { sessionId: string }) => callback(params);
       ipcRenderer.on(IPC_CHANNELS.APP_FOCUS_SESSION, handler);
@@ -596,6 +612,7 @@ const electronAPI = {
   env: {
     HOME: process.env.HOME || process.env.USERPROFILE || '',
     platform: process.platform as 'darwin' | 'win32' | 'linux',
+    osRelease: release(),
     appVersion: pkg.version,
   },
 

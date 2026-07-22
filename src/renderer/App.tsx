@@ -25,6 +25,7 @@ import {
   useGroupSync,
   useMenuActions,
   useMergeState,
+  useOpenContextListener,
   useOpenPathListener,
   usePanelState,
   useRepositoryState,
@@ -182,6 +183,34 @@ export default function App() {
       setIsAgentTasksPanelOpen(visible);
     });
   }, []);
+
+  // Bind Agent Tasks panel to Todo feature: hide panel when Todo is disabled
+  const todoEnabled = useSettingsStore((s) => s.todoEnabled);
+  useEffect(() => {
+    if (todoEnabled) return;
+
+    if (isAgentTasksPanelOpen) {
+      void window.electronAPI.agentTaskPanel.toggle();
+    }
+
+    // Leave Todo tab when the feature is turned off
+    if (activeTab === 'todo') {
+      setActiveTab('chat');
+      if (activeWorktree?.path) {
+        setWorktreeTabMap((prev) => ({
+          ...prev,
+          [activeWorktree.path]: 'chat',
+        }));
+      }
+    }
+  }, [
+    todoEnabled,
+    isAgentTasksPanelOpen,
+    activeTab,
+    activeWorktree?.path,
+    setActiveTab,
+    setWorktreeTabMap,
+  ]);
 
   // Respond to snapshot requests from agent task panel window
   useEffect(() => {
@@ -468,7 +497,22 @@ export default function App() {
   );
 
   useGroupSync(hideGroups, activeGroupId, setActiveGroupId, saveActiveGroupId);
-  useOpenPathListener(repositories, saveRepositories, setSelectedRepo);
+  useOpenPathListener({
+    repositories,
+    saveRepositories,
+    setSelectedRepo,
+    onSwitchWorktree: (path) => switchWorktreePathRef.current?.(path),
+    onSwitchTab: handleTabChange,
+    tempWorkspaces,
+  });
+  useOpenContextListener({
+    repositories,
+    saveRepositories,
+    setSelectedRepo,
+    onSwitchWorktree: (path) => switchWorktreePathRef.current?.(path),
+    onSwitchTab: handleTabChange,
+    tempWorkspaces,
+  });
   useFocusSession({
     onSwitchWorktree: (path) => switchWorktreePathRef.current?.(path),
     onSwitchTab: handleTabChange,

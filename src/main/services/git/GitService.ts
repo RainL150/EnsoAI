@@ -3,6 +3,7 @@ import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type {
+  BranchHeadInfo,
   CloneProgress,
   CommitFileChange,
   FileChange,
@@ -35,6 +36,12 @@ const execAsync = promisify(exec);
 const MAX_GIT_STATUS_ENTRIES = 5000;
 const MAX_GIT_FILE_CHANGES = 5000;
 const GIT_STATUS_STREAM_TIMEOUT_MS = 15000;
+const DIFF_STATS_CACHE_TTL_MS = 2_000;
+
+type DiffStats = {
+  insertions: number;
+  deletions: number;
+};
 
 type PorcelainBranchInfo = {
   current: string | null;
@@ -55,6 +62,8 @@ type LimitedGitStatus = PorcelainBranchInfo & {
 export class GitService {
   private git: SimpleGit;
   private workdir: string;
+  private diffStatsCache: { value: DiffStats; expiresAt: number } | null = null;
+  private diffStatsInFlight: Promise<DiffStats> | null = null;
 
   constructor(workdir: string) {
     this.git = createSimpleGit(workdir);
@@ -392,6 +401,31 @@ export class GitService {
       throw error;
     }
     return parseGitLogOutput(result);
+  }
+
+  async getBranchHeadInfo(branchName: string): Promise<BranchHeadInfo | null> {
+    // %x1f = unit separator, used to safely split fields that may contain spaces
+    const format = '%H%x1f%h%x1f%s%x1f%aI%x1f%an';
+    try {
+      const result = await this.git.raw([
+        'log',
+        '-1',
+        `--pretty=format:${format}`,
+        branchName,
+        '--',
+      ]);
+      const parts = result.split('\x1f');
+      if (parts.length < 5) return null;
+      return {
+        hash: parts[0],
+        shortHash: parts[1],
+        message: parts[2],
+        date: parts[3],
+        author: parts[4],
+      };
+    } catch {
+      return null;
+    }
   }
 
   async commit(message: string, files?: string[]): Promise<string> {
@@ -844,24 +878,51 @@ export class GitService {
     };
   }
 
-  async getDiffStats(): Promise<{ insertions: number; deletions: number }> {
-    try {
-      // Get stats for both staged and unstaged changes
-      const output = await this.git.diff(['--shortstat', 'HEAD']);
-      // Output format: " 3 files changed, 10 insertions(+), 5 deletions(-)"
-      // or empty if no changes
-      if (!output.trim()) {
-        return { insertions: 0, deletions: 0 };
+  async getDiffStats(): Promise<DiffStats> {
+    if (this.diffStatsCache && this.diffStatsCache.expiresAt > Date.now()) {
+      return this.diffStatsCache.value;
+    }
+
+    if (this.diffStatsInFlight) {
+      return this.diffStatsInFlight;
+    }
+
+    const request = (async (): Promise<DiffStats> => {
+      let result: DiffStats;
+      try {
+        // Get stats for both staged and unstaged changes
+        const output = await this.git.diff(['--shortstat', 'HEAD']);
+        // Output format: " 3 files changed, 10 insertions(+), 5 deletions(-)"
+        // or empty if no changes
+        if (!output.trim()) {
+          result = { insertions: 0, deletions: 0 };
+        } else {
+          const insertionsMatch = output.match(/(\d+)\s+insertion/);
+          const deletionsMatch = output.match(/(\d+)\s+deletion/);
+          result = {
+            insertions: insertionsMatch ? Number.parseInt(insertionsMatch[1], 10) : 0,
+            deletions: deletionsMatch ? Number.parseInt(deletionsMatch[1], 10) : 0,
+          };
+        }
+      } catch {
+        // Repository might not have HEAD (empty repo) or other issues
+        result = { insertions: 0, deletions: 0 };
       }
-      const insertionsMatch = output.match(/(\d+)\s+insertion/);
-      const deletionsMatch = output.match(/(\d+)\s+deletion/);
-      return {
-        insertions: insertionsMatch ? Number.parseInt(insertionsMatch[1], 10) : 0,
-        deletions: deletionsMatch ? Number.parseInt(deletionsMatch[1], 10) : 0,
+
+      this.diffStatsCache = {
+        value: result,
+        expiresAt: Date.now() + DIFF_STATS_CACHE_TTL_MS,
       };
-    } catch {
-      // Repository might not have HEAD (empty repo) or other issues
-      return { insertions: 0, deletions: 0 };
+      return result;
+    })();
+
+    this.diffStatsInFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (this.diffStatsInFlight === request) {
+        this.diffStatsInFlight = null;
+      }
     }
   }
 
