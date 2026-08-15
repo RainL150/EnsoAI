@@ -22,12 +22,14 @@ export function useTerminal() {
         ...options,
         shellConfig: options?.shell ? undefined : shellConfig,
       };
-      const id = await window.electronAPI.terminal.create(createOptions);
+      const { id } = await window.electronAPI.terminal.create(createOptions);
       addSession({
         id,
         title: 'Terminal',
         cwd: options?.cwd || window.electronAPI.env.HOME || '/',
       });
+      // Windows helper 会在激活前缓存启动输出和快速退出，监听与会话登记完成后再释放。
+      await window.electronAPI.terminal.activate(id);
       return id;
     },
     [addSession, shellConfig]

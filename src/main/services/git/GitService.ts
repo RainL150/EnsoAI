@@ -3,6 +3,7 @@ import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type {
+  BranchHeadInfo,
   CloneProgress,
   CommitFileChange,
   FileChange,
@@ -12,6 +13,8 @@ import type {
   GhCliStatus,
   GitBlameLineInfo,
   GitBranch,
+  GitGraphLogPage,
+  GitGraphRef,
   GitLogEntry,
   GitStatus,
   GitSubmodule,
@@ -20,6 +23,12 @@ import type {
 } from '@shared/types';
 import type { SimpleGit, StatusResult } from 'simple-git';
 import { decodeBuffer, detectBinaryFile, gitShow } from './encoding';
+import {
+  getGitGraphRefName,
+  isMissingGitRevisionError,
+  normalizeGitGraphRefs,
+  parseGitGraphReferences,
+} from './gitGraphFormat';
 import { GIT_LOG_PRETTY_FORMAT, parseGitLogOutput } from './gitLogFormat';
 import {
   createGitEnv,
@@ -35,6 +44,12 @@ const execAsync = promisify(exec);
 const MAX_GIT_STATUS_ENTRIES = 5000;
 const MAX_GIT_FILE_CHANGES = 5000;
 const GIT_STATUS_STREAM_TIMEOUT_MS = 15000;
+const DIFF_STATS_CACHE_TTL_MS = 2_000;
+
+type DiffStats = {
+  insertions: number;
+  deletions: number;
+};
 
 type PorcelainBranchInfo = {
   current: string | null;
@@ -55,6 +70,8 @@ type LimitedGitStatus = PorcelainBranchInfo & {
 export class GitService {
   private git: SimpleGit;
   private workdir: string;
+  private diffStatsCache: { value: DiffStats; expiresAt: number } | null = null;
+  private diffStatsInFlight: Promise<DiffStats> | null = null;
 
   constructor(workdir: string) {
     this.git = createSimpleGit(workdir);
@@ -392,6 +409,114 @@ export class GitService {
       throw error;
     }
     return parseGitLogOutput(result);
+  }
+
+  async getGraphLog(maxCount = 50, skip = 0, submodulePath?: string): Promise<GitGraphLogPage> {
+    const git = this.getGitInstance(submodulePath);
+    const resolveName = async (args: string[]): Promise<string | null> => {
+      try {
+        return (await git.raw(args)).trim() || null;
+      } catch {
+        return null;
+      }
+    };
+    const resolveRequiredRevision = async (id: string): Promise<string | null> => {
+      try {
+        return (await git.raw(['rev-parse', '--verify', id])).trim() || null;
+      } catch (error) {
+        // 空仓库没有可解析的提交；权限、Git 不可用或仓库损坏等错误必须继续抛出。
+        if (isMissingGitRevisionError(error)) return null;
+        throw error;
+      }
+    };
+    const resolveRef = async (id: string | null, required = false): Promise<GitGraphRef | null> => {
+      if (!id) return null;
+      const revision = required
+        ? await resolveRequiredRevision(id)
+        : await resolveName(['rev-parse', '--verify', id]);
+      return revision ? { id, name: getGitGraphRefName(id), revision } : null;
+    };
+
+    // 图表查询当前分支、远程跟踪分支和 VS Code 配置的基准分支。
+    const currentId = (await resolveName(['symbolic-ref', '--quiet', 'HEAD'])) ?? 'HEAD';
+    const remoteId = await resolveName(['rev-parse', '--symbolic-full-name', '@{upstream}']);
+    const baseName = currentId.startsWith('refs/heads/')
+      ? await resolveName([
+          'config',
+          '--get',
+          `branch.${getGitGraphRefName(currentId)}.vscode-merge-base`,
+        ])
+      : null;
+    const baseId = baseName
+      ? await resolveName(['rev-parse', '--symbolic-full-name', baseName])
+      : null;
+    const refs = normalizeGitGraphRefs(
+      await resolveRef(currentId, true),
+      await resolveRef(remoteId),
+      await resolveRef(baseId)
+    );
+    const mergeBase =
+      refs.current && refs.remote && refs.current.revision !== refs.remote.revision
+        ? await resolveName(['merge-base', refs.current.revision, refs.remote.revision])
+        : refs.current?.revision === refs.remote?.revision
+          ? (refs.current?.revision ?? null)
+          : null;
+    const refNames = Array.from(
+      new Set([refs.current?.id, refs.remote?.id, refs.base?.id].filter(Boolean))
+    ) as string[];
+
+    if (refNames.length === 0) return { entries: [], refs, mergeBase: null };
+
+    const options: string[] = [
+      '--parents',
+      '--topo-order',
+      '--decorate=full',
+      `-n${maxCount}`,
+      `--pretty=format:${GIT_LOG_PRETTY_FORMAT}`,
+    ];
+    if (skip > 0) {
+      options.push(`--skip=${skip}`);
+    }
+
+    let result: string;
+    try {
+      result = await git.raw(['log', ...options, ...refNames]);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('does not have any commits yet')) {
+        return { entries: [], refs, mergeBase: null };
+      }
+      throw error;
+    }
+    const entries = parseGitLogOutput(result).map((entry) => ({
+      ...entry,
+      references: parseGitGraphReferences(entry.refs, entry.hash),
+    }));
+    return { entries, refs, mergeBase };
+  }
+
+  async getBranchHeadInfo(branchName: string): Promise<BranchHeadInfo | null> {
+    // %x1f = unit separator, used to safely split fields that may contain spaces
+    const format = '%H%x1f%h%x1f%s%x1f%aI%x1f%an';
+    try {
+      const result = await this.git.raw([
+        'log',
+        '-1',
+        `--pretty=format:${format}`,
+        branchName,
+        '--',
+      ]);
+      const parts = result.split('\x1f');
+      if (parts.length < 5) return null;
+      return {
+        hash: parts[0],
+        shortHash: parts[1],
+        message: parts[2],
+        date: parts[3],
+        author: parts[4],
+      };
+    } catch {
+      return null;
+    }
   }
 
   async commit(message: string, files?: string[]): Promise<string> {
@@ -844,24 +969,51 @@ export class GitService {
     };
   }
 
-  async getDiffStats(): Promise<{ insertions: number; deletions: number }> {
-    try {
-      // Get stats for both staged and unstaged changes
-      const output = await this.git.diff(['--shortstat', 'HEAD']);
-      // Output format: " 3 files changed, 10 insertions(+), 5 deletions(-)"
-      // or empty if no changes
-      if (!output.trim()) {
-        return { insertions: 0, deletions: 0 };
+  async getDiffStats(): Promise<DiffStats> {
+    if (this.diffStatsCache && this.diffStatsCache.expiresAt > Date.now()) {
+      return this.diffStatsCache.value;
+    }
+
+    if (this.diffStatsInFlight) {
+      return this.diffStatsInFlight;
+    }
+
+    const request = (async (): Promise<DiffStats> => {
+      let result: DiffStats;
+      try {
+        // Get stats for both staged and unstaged changes
+        const output = await this.git.diff(['--shortstat', 'HEAD']);
+        // Output format: " 3 files changed, 10 insertions(+), 5 deletions(-)"
+        // or empty if no changes
+        if (!output.trim()) {
+          result = { insertions: 0, deletions: 0 };
+        } else {
+          const insertionsMatch = output.match(/(\d+)\s+insertion/);
+          const deletionsMatch = output.match(/(\d+)\s+deletion/);
+          result = {
+            insertions: insertionsMatch ? Number.parseInt(insertionsMatch[1], 10) : 0,
+            deletions: deletionsMatch ? Number.parseInt(deletionsMatch[1], 10) : 0,
+          };
+        }
+      } catch {
+        // Repository might not have HEAD (empty repo) or other issues
+        result = { insertions: 0, deletions: 0 };
       }
-      const insertionsMatch = output.match(/(\d+)\s+insertion/);
-      const deletionsMatch = output.match(/(\d+)\s+deletion/);
-      return {
-        insertions: insertionsMatch ? Number.parseInt(insertionsMatch[1], 10) : 0,
-        deletions: deletionsMatch ? Number.parseInt(deletionsMatch[1], 10) : 0,
+
+      this.diffStatsCache = {
+        value: result,
+        expiresAt: Date.now() + DIFF_STATS_CACHE_TTL_MS,
       };
-    } catch {
-      // Repository might not have HEAD (empty repo) or other issues
-      return { insertions: 0, deletions: 0 };
+      return result;
+    })();
+
+    this.diffStatsInFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (this.diffStatsInFlight === request) {
+        this.diffStatsInFlight = null;
+      }
     }
   }
 

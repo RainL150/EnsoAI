@@ -110,6 +110,10 @@ export function GeneralSettings() {
     setTerminalRenderer,
     terminalScrollback,
     setTerminalScrollback,
+    windowsConptyCompatibilityFixEnabled,
+    setWindowsConptyCompatibilityFixEnabled,
+    codexSessionHistoryButtonEnabled,
+    setCodexSessionHistoryButtonEnabled,
     shellConfig,
     setShellConfig,
     agentNotificationEnabled,
@@ -596,7 +600,9 @@ export function GeneralSettings() {
       <div className="grid grid-cols-[100px_1fr] items-center gap-4">
         <span className="text-sm font-medium">{t('Todo')}</span>
         <div className="flex items-center justify-between">
-          <p className="text-sm text-muted-foreground">{t('Enable Todo kanban board tab')}</p>
+          <p className="text-sm text-muted-foreground">
+            {t('Enable Todo kanban board tab and Agent Tasks panel')}
+          </p>
           <Switch checked={todoEnabled} onCheckedChange={setTodoEnabled} />
         </div>
       </div>
@@ -1030,6 +1036,40 @@ export function GeneralSettings() {
             {t('History lines in the terminal. Higher values use more memory.')}
           </p>
           <p className="text-xs text-muted-foreground">{t('Apply on new terminals only')}</p>
+        </div>
+      </div>
+
+      {/* Windows ConPTY compatibility */}
+      {isWindows && (
+        <div className="grid grid-cols-[100px_1fr] items-center gap-4">
+          <span className="text-sm font-medium">{t('Windows scrollback patch')}</span>
+          <div className="flex min-w-0 items-center justify-between gap-4">
+            <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+              {t(
+                'Improves Codex CLI scrollback and scrollbar issues after clear-screen redraws. Recommended to enable on Windows versions below 25H2.'
+              )}
+            </p>
+            <Switch
+              className="shrink-0"
+              checked={windowsConptyCompatibilityFixEnabled}
+              onCheckedChange={setWindowsConptyCompatibilityFixEnabled}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Codex session history button */}
+      <div className="grid grid-cols-[100px_1fr] items-center gap-4">
+        <span className="text-sm font-medium">{t('Codex session history button')}</span>
+        <div className="flex min-w-0 items-center justify-between gap-4">
+          <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+            {t('Show the history button in Codex tabs to view local Codex conversation records.')}
+          </p>
+          <Switch
+            className="shrink-0"
+            checked={codexSessionHistoryButtonEnabled}
+            onCheckedChange={setCodexSessionHistoryButtonEnabled}
+          />
         </div>
       </div>
 

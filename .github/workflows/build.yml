@@ -139,7 +139,8 @@ jobs:
 
   build-windows:
     needs: build-app
-    runs-on: windows-latest
+    # windows-latest now ships VS 2026, which node-gyp <12.1 cannot detect
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4

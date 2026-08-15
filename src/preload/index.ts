@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { release } from 'node:os';
 import 'electron-log/preload.js';
 import type { Locale } from '@shared/i18n';
 import type {
@@ -6,6 +7,12 @@ import type {
   AgentMetadata,
   CloneProgress,
   CloneResult,
+  CodexHistoryQuery,
+  CodexHistoryResult,
+  CodexLatestSessionQuery,
+  CodexLatestSessionResult,
+  CodexSessionListQuery,
+  CodexSessionListResult,
   CommitFileChange,
   ConflictResolution,
   ContentSearchParams,
@@ -22,6 +29,7 @@ import type {
   FileSearchResult,
   GhCliStatus,
   GitBranch,
+  GitGraphLogPage,
   GitLogEntry,
   GitStatus,
   GitSubmodule,
@@ -41,6 +49,7 @@ import type {
   TempWorkspaceCreateResult,
   TempWorkspaceRemoveResult,
   TerminalCreateOptions,
+  TerminalCreateResult,
   TerminalResizeOptions,
   ValidateLocalPathResult,
   ValidateUrlResult,
@@ -53,10 +62,14 @@ import type {
 import { IPC_CHANNELS } from '@shared/types';
 import type { AgentStopNotificationData } from '@shared/types/agent';
 import type { InspectPayload, WebInspectorStatus } from '@shared/types/webInspector';
-import { contextBridge, ipcRenderer, shell, webUtils } from 'electron';
+import { clipboard, contextBridge, ipcRenderer, shell, webUtils } from 'electron';
 import pkg from '../../package.json';
 
 const electronAPI = {
+  clipboard: {
+    writeText: (text: string): void => clipboard.writeText(text),
+  },
+
   // Git
   git: {
     getStatus: (workdir: string): Promise<GitStatus> =>
@@ -68,12 +81,24 @@ const electronAPI = {
       submodulePath?: string
     ): Promise<GitLogEntry[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_LOG, workdir, maxCount, skip, submodulePath),
+    getGraphLog: (
+      workdir: string,
+      maxCount?: number,
+      skip?: number,
+      submodulePath?: string
+    ): Promise<GitGraphLogPage> =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_GRAPH_LOG, workdir, maxCount, skip, submodulePath),
     getBranches: (workdir: string): Promise<GitBranch[]> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_LIST, workdir),
     createBranch: (workdir: string, name: string, startPoint?: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_CREATE, workdir, name, startPoint),
     checkout: (workdir: string, branch: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_CHECKOUT, workdir, branch),
+    getBranchHeadInfo: (
+      workdir: string,
+      branchName: string
+    ): Promise<import('@shared/types').BranchHeadInfo | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.GIT_BRANCH_HEAD_INFO, workdir, branchName),
     commit: (workdir: string, message: string, files?: string[]): Promise<string> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_COMMIT, workdir, message, files),
     push: (
@@ -173,10 +198,10 @@ const electronAPI = {
         effortLevel?: string;
         reviewId: string;
         language?: string;
-        sessionId?: string; // Restore this parameter for "Continue Conversation"
+        sessionId?: string; // Optional review session token for providers that still support "Continue Conversation"
         prompt?: string; // Custom prompt template
       }
-    ): Promise<{ success: boolean; error?: string; sessionId?: string }> =>
+    ): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_CODE_REVIEW_START, workdir, options),
     stopCodeReview: (reviewId: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.GIT_CODE_REVIEW_STOP, reviewId),
@@ -386,8 +411,9 @@ const electronAPI = {
 
   // Terminal
   terminal: {
-    create: (options?: TerminalCreateOptions): Promise<string> =>
+    create: (options?: TerminalCreateOptions): Promise<TerminalCreateResult> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_CREATE, options),
+    activate: (id: string): Promise<void> => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_ACTIVATE, id),
     write: (id: string, data: string): Promise<void> =>
       ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_WRITE, id, data),
     resize: (id: string, size: TerminalResizeOptions): Promise<void> =>
@@ -413,6 +439,16 @@ const electronAPI = {
   // Agent
   agent: {
     list: (): Promise<AgentMetadata[]> => ipcRenderer.invoke(IPC_CHANNELS.AGENT_LIST),
+  },
+
+  // Codex History
+  codexHistory: {
+    get: (query: CodexHistoryQuery): Promise<CodexHistoryResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.CODEX_HISTORY_GET, query),
+    findLatest: (query: CodexLatestSessionQuery): Promise<CodexLatestSessionResult | null> =>
+      ipcRenderer.invoke(IPC_CHANNELS.CODEX_HISTORY_FIND_LATEST, query),
+    listSessions: (query: CodexSessionListQuery): Promise<CodexSessionListResult> =>
+      ipcRenderer.invoke(IPC_CHANNELS.CODEX_HISTORY_LIST_SESSIONS, query),
   },
 
   // App
@@ -606,6 +642,7 @@ const electronAPI = {
   env: {
     HOME: process.env.HOME || process.env.USERPROFILE || '',
     platform: process.platform as 'darwin' | 'win32' | 'linux',
+    osRelease: release(),
     appVersion: pkg.version,
   },
 

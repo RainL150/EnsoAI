@@ -1,14 +1,24 @@
 import { execSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, release } from 'node:os';
 import { delimiter, join } from 'node:path';
-import type { TerminalCreateOptions } from '@shared/types';
-import * as pty from 'node-pty';
+import type { TerminalCreateOptions, TerminalCreateResult } from '@shared/types';
+import type { IPty } from 'node-pty';
 import pidtree from 'pidtree';
 import pidusage from 'pidusage';
 import { killProcessTree } from '../../utils/processUtils';
 import { getProxyEnvVars } from '../proxy/ProxyConfig';
 import { detectShell, shellDetector } from './ShellDetector';
+import {
+  createWindowsPtyWithFallback,
+  resolveWindowsPtyBackend,
+  startWindowsPtyHelper,
+  type WindowsPtyHelperAttempt,
+  type WindowsPtyHelperCallbacks,
+  type WindowsPtyHelperRequest,
+  type WindowsPtyHelperSession,
+} from './WindowsPtyHelper';
+import { createWindowsConptyCompatibilityOptions } from './windowsConptyCompatibility';
 
 const isWindows = process.platform === 'win32';
 
@@ -200,16 +210,55 @@ function getWindowsRegistryPath(): string {
   }
 }
 
-interface PtySession {
-  pty: pty.IPty;
+type TerminalDataHandler = (id: string, data: string) => void;
+type TerminalExitHandler = (id: string, exitCode: number, signal?: number) => void;
+
+interface BasePtySession {
   cwd: string;
   ownerId: number | null;
-  onData: (data: string) => void;
-  onExit?: (exitCode: number, signal?: number) => void;
+  onExit?: TerminalExitHandler;
+}
+
+interface LocalPtySession extends BasePtySession {
+  kind: 'local';
+  pty: IPty;
   // node-pty returns disposables for event subscriptions; keep them so we can
   // dispose during shutdown and avoid native threads hanging during Node cleanup.
   dataDisposable: { dispose(): void };
   exitDisposable?: { dispose(): void };
+}
+
+interface WindowsHelperPtySession extends BasePtySession {
+  kind: 'windows-helper';
+  helper: WindowsPtyHelperSession;
+  ptyPid: number;
+  activated: boolean;
+}
+
+type PtySession = LocalPtySession | WindowsHelperPtySession;
+
+interface PendingWindowsSession {
+  ownerId: number | null;
+  cwd: string;
+  cancelled: boolean;
+  cancel: () => Promise<void>;
+  exitEvent?: { exitCode: number; signal?: number };
+}
+
+interface PendingLocalSession {
+  ownerId: number | null;
+  cwd: string;
+  cancelled: boolean;
+}
+
+export interface PtyManagerDependencies {
+  platform?: NodeJS.Platform;
+  osRelease?: string;
+  loadNodePty?: () => Promise<typeof import('node-pty')>;
+  startWindowsPtyHelper?: (
+    request: WindowsPtyHelperRequest,
+    callbacks: WindowsPtyHelperCallbacks
+  ) => WindowsPtyHelperAttempt;
 }
 
 function findFallbackShell(): string {
@@ -342,7 +391,16 @@ export function getEnhancedPath(): string {
 
 export class PtyManager {
   private sessions = new Map<string, PtySession>();
+  private pendingWindowsSessions = new Map<string, PendingWindowsSession>();
+  private pendingLocalSessions = new Map<string, PendingLocalSession>();
   private counter = 0;
+  private readonly platform: NodeJS.Platform;
+  private readonly osRelease: string;
+  private readonly loadNodePty: () => Promise<typeof import('node-pty')>;
+  private readonly startWindowsPtyHelper: (
+    request: WindowsPtyHelperRequest,
+    callbacks: WindowsPtyHelperCallbacks
+  ) => WindowsPtyHelperAttempt;
   private activityRequestCounter = 0;
   // 活动检测缓存：{ ptyId: { lastCheckTs, lastValue, inFlightPromise } }
   private activityCache = new Map<
@@ -356,12 +414,19 @@ export class PtyManager {
   >();
   private readonly ACTIVITY_CACHE_TTL_MS = 2000; // 缓存 2 秒
 
-  create(
+  constructor(dependencies: PtyManagerDependencies = {}) {
+    this.platform = dependencies.platform ?? process.platform;
+    this.osRelease = dependencies.osRelease ?? release();
+    this.loadNodePty = dependencies.loadNodePty ?? (() => import('node-pty'));
+    this.startWindowsPtyHelper = dependencies.startWindowsPtyHelper ?? startWindowsPtyHelper;
+  }
+
+  async create(
     options: TerminalCreateOptions,
-    onData: (data: string) => void,
-    onExit?: (exitCode: number, signal?: number) => void,
+    onData: TerminalDataHandler,
+    onExit?: TerminalExitHandler,
     ownerId: number | null = null
-  ): string {
+  ): Promise<TerminalCreateResult> {
     const id = `pty-${++this.counter}`;
     const home = process.env.HOME || process.env.USERPROFILE || homedir();
     const cwd = options.cwd || home;
@@ -381,7 +446,7 @@ export class PtyManager {
       args = options.args || [];
     }
 
-    if (!isWindows && shell.includes('/') && !existsSync(shell)) {
+    if (this.platform !== 'win32' && shell.includes('/') && !existsSync(shell)) {
       const fallbackShell = findFallbackShell();
       console.warn(`[pty] Shell not found: ${shell}. Falling back to ${fallbackShell}`);
       shell = fallbackShell;
@@ -390,7 +455,7 @@ export class PtyManager {
 
     const initialCommand = options.initialCommand?.trim();
     if (initialCommand) {
-      if (isWindows) {
+      if (this.platform === 'win32') {
         const isPowerShell =
           shell.toLowerCase().includes('powershell') || shell.toLowerCase().includes('pwsh');
         if (isPowerShell) {
@@ -403,7 +468,6 @@ export class PtyManager {
       }
     }
 
-    let ptyProcess: pty.IPty;
     const baseEnv: Record<string, string> = {
       ...process.env,
       ...getProxyEnvVars(),
@@ -416,126 +480,319 @@ export class PtyManager {
     } as Record<string, string>;
     applyEnhancedPath(baseEnv);
 
+    const windowsConptyCompatibility = createWindowsConptyCompatibilityOptions({
+      platform: this.platform,
+      settingEnabled: options.windowsConptyCompatibilityFixEnabled,
+    });
+    if (this.platform === 'win32') {
+      return this.createWindowsSession(
+        id,
+        options,
+        shell,
+        args,
+        cwd,
+        baseEnv,
+        windowsConptyCompatibility.useConptyDll,
+        onData,
+        onExit,
+        ownerId
+      );
+    }
+
+    const pendingLocal: PendingLocalSession = { ownerId, cwd, cancelled: false };
+    this.pendingLocalSessions.set(id, pendingLocal);
+
     try {
-      ptyProcess = pty.spawn(shell, args, {
+      const pty = await this.loadNodePty();
+      if (pendingLocal.cancelled) throw new Error('PTY creation cancelled');
+
+      let ptyProcess: IPty;
+      const spawnOptions = {
         name: 'xterm-256color',
         cols: options.cols || 80,
         rows: options.rows || 24,
         cwd,
         env: baseEnv,
-      });
-    } catch (error) {
-      if (!isWindows) {
-        const fallbackShell = findFallbackShell();
-        if (fallbackShell !== shell) {
-          const fallbackArgs = adjustArgsForShell(fallbackShell, args);
-          console.warn(`[pty] Failed to spawn ${shell}. Falling back to ${fallbackShell}`);
-          ptyProcess = pty.spawn(fallbackShell, fallbackArgs, {
-            name: 'xterm-256color',
-            cols: options.cols || 80,
-            rows: options.rows || 24,
-            cwd,
-            env: {
-              ...process.env,
-              ...getProxyEnvVars(),
-              ...options.env,
-              TERM: 'xterm-256color',
-              COLORTERM: 'truecolor',
-              // Ensure proper locale for UTF-8 support (GUI apps may not inherit LANG)
-              LANG: process.env.LANG || 'en_US.UTF-8',
-              LC_ALL: process.env.LC_ALL || process.env.LANG || 'en_US.UTF-8',
-            } as Record<string, string>,
-          });
-          shell = fallbackShell;
-          args = fallbackArgs;
+      };
+      try {
+        ptyProcess = pty.spawn(shell, args, spawnOptions);
+      } catch (error) {
+        if (!isWindows) {
+          const fallbackShell = findFallbackShell();
+          if (fallbackShell !== shell) {
+            const fallbackArgs = adjustArgsForShell(fallbackShell, args);
+            console.warn(`[pty] Failed to spawn ${shell}. Falling back to ${fallbackShell}`);
+            ptyProcess = pty.spawn(fallbackShell, fallbackArgs, {
+              name: 'xterm-256color',
+              cols: options.cols || 80,
+              rows: options.rows || 24,
+              cwd,
+              env: {
+                ...process.env,
+                ...getProxyEnvVars(),
+                ...options.env,
+                TERM: 'xterm-256color',
+                COLORTERM: 'truecolor',
+                // Ensure proper locale for UTF-8 support (GUI apps may not inherit LANG)
+                LANG: process.env.LANG || 'en_US.UTF-8',
+                LC_ALL: process.env.LC_ALL || process.env.LANG || 'en_US.UTF-8',
+              } as Record<string, string>,
+            });
+            shell = fallbackShell;
+            args = fallbackArgs;
+          } else {
+            throw error;
+          }
         } else {
           throw error;
         }
-      } else {
-        throw error;
       }
+
+      if (pendingLocal.cancelled) {
+        killProcessTree(ptyProcess);
+        throw new Error('PTY creation cancelled');
+      }
+
+      const dataDisposable = ptyProcess.onData((data) => {
+        onData(id, data);
+      });
+
+      // Store session first so onExit callback can access it
+      const session: LocalPtySession = {
+        kind: 'local',
+        pty: ptyProcess,
+        cwd,
+        ownerId,
+        onExit,
+        dataDisposable,
+      };
+      this.sessions.set(id, session);
+
+      const exitDisposable = ptyProcess.onExit(({ exitCode, signal }) => {
+        // Read onExit from session to allow it to be replaced during cleanup
+        const currentSession = this.sessions.get(id);
+        if (currentSession?.kind !== 'local') return;
+        const exitHandler = currentSession.onExit;
+
+        // Dispose subscriptions promptly to release native resources (node-pty TSFN)
+        try {
+          currentSession.dataDisposable.dispose();
+        } catch {
+          // Ignore
+        }
+        try {
+          currentSession.exitDisposable?.dispose();
+        } catch {
+          // Ignore
+        }
+
+        this.sessions.delete(id);
+        this.activityCache.delete(id);
+        exitHandler?.(id, exitCode, signal);
+      });
+      session.exitDisposable = exitDisposable;
+
+      return { id };
+    } finally {
+      this.pendingLocalSessions.delete(id);
     }
+  }
 
-    const dataDisposable = ptyProcess.onData((data) => {
-      onData(data);
-    });
+  private async createWindowsSession(
+    id: string,
+    options: TerminalCreateOptions,
+    shell: string,
+    args: string[],
+    cwd: string,
+    baseEnv: Record<string, string>,
+    useBundledConpty: boolean,
+    onData: TerminalDataHandler,
+    onExit: TerminalExitHandler | undefined,
+    ownerId: number | null
+  ): Promise<TerminalCreateResult> {
+    let currentAttempt: WindowsPtyHelperAttempt | null = null;
+    const pending: PendingWindowsSession = {
+      ownerId,
+      cwd,
+      cancelled: false,
+      cancel: async () => {
+        pending.cancelled = true;
+        await currentAttempt?.cancel();
+      },
+    };
+    this.pendingWindowsSessions.set(id, pending);
 
-    // Store session first so onExit callback can access it
-    const session: PtySession = { pty: ptyProcess, cwd, ownerId, onData, onExit, dataDisposable };
-    this.sessions.set(id, session);
+    const callbacks: WindowsPtyHelperCallbacks = {
+      onData: (data) => onData(id, data),
+      onExit: (exitCode, signal) => {
+        const currentSession = this.sessions.get(id);
+        if (currentSession?.kind !== 'windows-helper') {
+          if (!pending.cancelled) pending.exitEvent = { exitCode, signal };
+          return;
+        }
+        this.sessions.delete(id);
+        this.activityCache.delete(id);
+        currentSession.onExit?.(id, exitCode, signal);
+      },
+      onError: (error) => {
+        console.error(`[pty] Windows helper error for ${id}:`, error);
+      },
+    };
 
-    const exitDisposable = ptyProcess.onExit(({ exitCode, signal }) => {
-      // Read onExit from session to allow it to be replaced during cleanup
-      const currentSession = this.sessions.get(id);
-      const exitHandler = currentSession?.onExit;
+    const request: WindowsPtyHelperRequest = {
+      shell,
+      args,
+      options: {
+        name: 'xterm-256color',
+        cols: options.cols || 80,
+        rows: options.rows || 24,
+        cwd,
+        env: baseEnv,
+        useConptyDll: useBundledConpty,
+      },
+    };
 
-      // Dispose subscriptions promptly to release native resources (node-pty TSFN)
-      try {
-        currentSession?.dataDisposable.dispose();
-      } catch {
-        // Ignore
+    try {
+      const windowsPtyBackend = resolveWindowsPtyBackend(this.osRelease);
+      const { session: helperSession, conptySource } = await createWindowsPtyWithFallback({
+        backend: windowsPtyBackend,
+        request,
+        useBundledConpty,
+        createAttempt: async (attemptRequest) => {
+          if (pending.cancelled) throw new Error('PTY creation cancelled');
+          const attempt = this.startWindowsPtyHelper(attemptRequest, callbacks);
+          currentAttempt = attempt;
+          try {
+            return await attempt.ready;
+          } catch (error) {
+            await attempt.cancel();
+            throw error;
+          }
+        },
+      });
+
+      if (pending.cancelled) {
+        await helperSession.destroyAndWait();
+        throw new Error('PTY creation cancelled');
       }
-      try {
-        currentSession?.exitDisposable?.dispose();
-      } catch {
-        // Ignore
+
+      this.pendingWindowsSessions.delete(id);
+      const session: WindowsHelperPtySession = {
+        kind: 'windows-helper',
+        helper: helperSession,
+        ptyPid: helperSession.ptyPid,
+        activated: false,
+        cwd,
+        ownerId,
+        onExit,
+      };
+      this.sessions.set(id, session);
+
+      const pendingExit = pending.exitEvent;
+      if (pendingExit) {
+        this.sessions.delete(id);
+        this.activityCache.delete(id);
+        onExit?.(id, pendingExit.exitCode, pendingExit.signal);
       }
+      return {
+        id,
+        windowsPtyBackend,
+        ...(conptySource ? { windowsConptySource: conptySource } : {}),
+      };
+    } catch (error) {
+      this.pendingWindowsSessions.delete(id);
+      throw error;
+    }
+  }
 
-      this.sessions.delete(id);
-      this.activityCache.delete(id);
-      exitHandler?.(exitCode, signal);
-    });
-    session.exitDisposable = exitDisposable;
+  activate(id: string): void {
+    const session = this.sessions.get(id);
+    if (!session || session.kind !== 'windows-helper' || session.activated) return;
 
-    return id;
+    // 等渲染进程注册输出和退出监听器后，再释放 Windows helper 的启动事件。
+    session.activated = true;
+    session.helper.activate();
   }
 
   write(id: string, data: string): void {
     const session = this.sessions.get(id);
-    if (session) {
-      session.pty.write(data);
-    }
+    if (!session) return;
+    if (session.kind === 'windows-helper') session.helper.write(data);
+    else session.pty.write(data);
   }
 
   resize(id: string, cols: number, rows: number): void {
     const session = this.sessions.get(id);
-    if (session) {
-      session.pty.resize(cols, rows);
-    }
+    if (!session) return;
+    if (session.kind === 'windows-helper') session.helper.resize(cols, rows);
+    else session.pty.resize(cols, rows);
   }
 
   destroy(id: string): void {
-    const session = this.sessions.get(id);
-    if (session) {
-      // Stop delivering data/exit callbacks immediately.
-      try {
-        session.dataDisposable.dispose();
-      } catch {
-        // Ignore
-      }
-      try {
-        session.exitDisposable?.dispose();
-      } catch {
-        // Ignore
-      }
-      killProcessTree(session.pty);
-      this.sessions.delete(id);
-      this.activityCache.delete(id);
+    const pending = this.pendingWindowsSessions.get(id);
+    if (pending) {
+      void pending.cancel();
+      return;
     }
+
+    const pendingLocal = this.pendingLocalSessions.get(id);
+    if (pendingLocal) {
+      pendingLocal.cancelled = true;
+      return;
+    }
+
+    const session = this.sessions.get(id);
+    if (!session) return;
+
+    this.sessions.delete(id);
+    this.activityCache.delete(id);
+    if (session.kind === 'windows-helper') {
+      void session.helper.destroyAndWait();
+      return;
+    }
+
+    // Stop delivering data/exit callbacks immediately.
+    try {
+      session.dataDisposable.dispose();
+    } catch {
+      // Ignore
+    }
+    try {
+      session.exitDisposable?.dispose();
+    } catch {
+      // Ignore
+    }
+    killProcessTree(session.pty);
   }
 
   /**
    * Destroy a PTY session and wait for it to fully exit.
    * Returns a promise that resolves when the process has exited.
    */
-  destroyAndWait(id: string, timeout = 3000): Promise<void> {
-    return new Promise((resolve) => {
-      const session = this.sessions.get(id);
-      if (!session) {
-        resolve();
-        return;
-      }
+  async destroyAndWait(id: string, timeout = 3000): Promise<void> {
+    const pending = this.pendingWindowsSessions.get(id);
+    if (pending) {
+      await pending.cancel();
+      return;
+    }
 
+    const pendingLocal = this.pendingLocalSessions.get(id);
+    if (pendingLocal) {
+      pendingLocal.cancelled = true;
+      return;
+    }
+
+    const session = this.sessions.get(id);
+    if (!session) return;
+
+    if (session.kind === 'windows-helper') {
+      this.sessions.delete(id);
+      this.activityCache.delete(id);
+      await session.helper.destroyAndWait(timeout);
+      return;
+    }
+
+    return new Promise((resolve) => {
       let resolved = false;
 
       // Stop data callbacks during shutdown; we only care about exit.
@@ -580,6 +837,12 @@ export class PtyManager {
   }
 
   destroyAll(): void {
+    for (const pending of this.pendingWindowsSessions.values()) {
+      void pending.cancel();
+    }
+    for (const pending of this.pendingLocalSessions.values()) {
+      pending.cancelled = true;
+    }
     const ids = Array.from(this.sessions.keys());
     for (const id of ids) {
       this.destroy(id);
@@ -587,6 +850,12 @@ export class PtyManager {
   }
 
   destroyByOwner(ownerId: number): void {
+    for (const pending of this.pendingWindowsSessions.values()) {
+      if (pending.ownerId === ownerId) void pending.cancel();
+    }
+    for (const pending of this.pendingLocalSessions.values()) {
+      if (pending.ownerId === ownerId) pending.cancelled = true;
+    }
     const ids = Array.from(this.sessions.entries())
       .filter(([, session]) => session.ownerId === ownerId)
       .map(([id]) => id);
@@ -600,16 +869,42 @@ export class PtyManager {
    * This should be used during app shutdown to prevent crashes.
    */
   async destroyAllAndWait(timeout = 3000): Promise<void> {
+    const pending = Array.from(this.pendingWindowsSessions.values());
+    const pendingLocal = Array.from(this.pendingLocalSessions.values());
+    for (const session of pendingLocal) session.cancelled = true;
     const ids = Array.from(this.sessions.keys());
-    if (ids.length === 0) return;
+    if (ids.length === 0 && pending.length === 0 && pendingLocal.length === 0) return;
 
-    console.log(`[pty] Destroying ${ids.length} PTY sessions...`);
-    await Promise.all(ids.map((id) => this.destroyAndWait(id, timeout)));
+    console.log(
+      `[pty] Destroying ${ids.length + pending.length + pendingLocal.length} PTY sessions...`
+    );
+    await Promise.all([
+      ...pending.map((session) => session.cancel()),
+      ...ids.map((id) => this.destroyAndWait(id, timeout)),
+    ]);
     console.log('[pty] All PTY sessions destroyed');
   }
 
   destroyByWorkdir(workdir: string): void {
     const normalizedWorkdir = workdir.replace(/\\/g, '/').toLowerCase();
+    for (const pending of this.pendingWindowsSessions.values()) {
+      const normalizedCwd = pending.cwd.replace(/\\/g, '/').toLowerCase();
+      if (
+        normalizedCwd === normalizedWorkdir ||
+        normalizedCwd.startsWith(`${normalizedWorkdir}/`)
+      ) {
+        void pending.cancel();
+      }
+    }
+    for (const pending of this.pendingLocalSessions.values()) {
+      const normalizedCwd = pending.cwd.replace(/\\/g, '/').toLowerCase();
+      if (
+        normalizedCwd === normalizedWorkdir ||
+        normalizedCwd.startsWith(`${normalizedWorkdir}/`)
+      ) {
+        pending.cancelled = true;
+      }
+    }
     const ids = Array.from(this.sessions.entries())
       .filter(([, session]) => {
         const normalizedCwd = session.cwd.replace(/\\/g, '/').toLowerCase();
@@ -639,7 +934,7 @@ export class PtyManager {
       return false;
     }
 
-    const pid = session.pty.pid;
+    const pid = session.kind === 'windows-helper' ? session.ptyPid : session.pty.pid;
     if (!pid) {
       this.activityCache.delete(id);
       return false;

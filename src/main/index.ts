@@ -44,6 +44,7 @@ import { readSettings } from './ipc/settings';
 import { registerWindowHandlers } from './ipc/window';
 import { registerClaudeBridgeIpcHandlers } from './services/claude/ClaudeIdeBridge';
 import { unwatchClaudeSettings } from './services/claude/ClaudeProviderManager';
+import { startCodexHistoryBackgroundIndexing } from './services/codex/CodexHistoryService';
 import {
   isAllowedLocalFilePath,
   registerAllowedLocalFileRoot,
@@ -228,7 +229,7 @@ function handleCommandLineArgs(argv: string[]): void {
   }
 
   // Send collected context if path is present
-  if (context && context.path) {
+  if (context?.path) {
     sendOpenContext(context);
   }
 }
@@ -694,6 +695,10 @@ app.whenReady().then(async () => {
   // IMPORTANT: Set up did-finish-load handler BEFORE handling command line args
   // to avoid race condition where page loads before handler is registered
   mainWindow.webContents.once('did-finish-load', () => {
+    setTimeout(() => {
+      startCodexHistoryBackgroundIndexing();
+    }, 1500);
+
     if (pendingOpenContext) {
       mainWindow?.webContents.send(IPC_CHANNELS.APP_OPEN_CONTEXT, pendingOpenContext);
       pendingOpenContext = null;

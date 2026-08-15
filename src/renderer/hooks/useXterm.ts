@@ -7,6 +7,8 @@ import { Terminal } from '@xterm/xterm';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { defaultDarkTheme, getXtermTheme } from '@/lib/ghosttyTheme';
 import { matchesKeybinding } from '@/lib/keybinding';
+import { stripTerminalColorQueryResponses } from '@/lib/terminalInputFilter';
+import { buildWindowsPtyCompatibilityOptions } from '@/lib/windowsPtyCompatibility';
 import { useNavigationStore } from '@/stores/navigation';
 import { useSettingsStore } from '@/stores/settings';
 import '@xterm/xterm/css/xterm.css';
@@ -31,6 +33,10 @@ function hasVisibleContent(data: string): boolean {
   return stripped.trim().length > 0;
 }
 
+function openTerminalExternalLink(_event: MouseEvent, uri: string): void {
+  void window.electronAPI.shell.openExternal(uri);
+}
+
 export interface UseXtermOptions {
   cwd?: string;
   command?: {
@@ -52,6 +58,7 @@ export interface UseXtermOptions {
   onSplit?: () => void;
   onMerge?: () => void;
   canMerge?: boolean;
+  filterTerminalColorQueryResponses?: boolean;
 }
 
 export interface UseXtermResult {
@@ -130,11 +137,17 @@ export function useXterm({
   onSplit,
   onMerge,
   canMerge = false,
+  filterTerminalColorQueryResponses = false,
 }: UseXtermOptions): UseXtermResult {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const settings = useTerminalSettings();
   const terminalRenderer = useSettingsStore((s) => s.terminalRenderer);
+  const windowsConptyCompatibilityFixEnabled = useSettingsStore(
+    (s) => s.windowsConptyCompatibilityFixEnabled
+  );
+  const useWindowsConptyCompatibility =
+    window.electronAPI.env.platform === 'win32' && windowsConptyCompatibilityFixEnabled;
   const copyOnSelection = useSettingsStore((s) => s.copyOnSelection);
   const shellConfig = useSettingsStore((s) => s.shellConfig);
   const navigateToFile = useNavigationStore((s) => s.navigateToFile);
@@ -298,17 +311,19 @@ export function useXterm({
       fontWeightBold: settings.fontWeightBold,
       theme: settings.theme,
       scrollback: settings.scrollback,
+      scrollOnEraseInDisplay: useWindowsConptyCompatibility,
       macOptionIsMeta: settings.optionIsMeta,
       allowProposedApi: true,
       allowTransparency: settings.backgroundImageEnabled,
       rescaleOverlappingGlyphs: true,
+      linkHandler: {
+        activate: openTerminalExternalLink,
+      },
     });
 
     const fitAddon = new FitAddon();
     const searchAddon = new SearchAddon();
-    const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      window.electronAPI.shell.openExternal(uri);
-    });
+    const webLinksAddon = new WebLinksAddon(openTerminalExternalLink);
     const unicode11Addon = new Unicode11Addon();
 
     terminal.loadAddon(fitAddon);
@@ -587,7 +602,11 @@ export function useXterm({
 
     try {
       const createRequestId = ++createRequestIdRef.current;
-      const ptyId = await window.electronAPI.terminal.create({
+      const {
+        id: ptyId,
+        windowsPtyBackend,
+        windowsConptySource,
+      } = await window.electronAPI.terminal.create({
         cwd: cwd || window.electronAPI.env.HOME,
         // If command is provided (e.g., for agent), use shell/args directly
         // Otherwise, use shellConfig from settings
@@ -595,12 +614,23 @@ export function useXterm({
         cols: terminal.cols,
         rows: terminal.rows,
         env,
+        windowsConptyCompatibilityFixEnabled: useWindowsConptyCompatibility,
         initialCommand: initialCommandRef.current,
       });
 
       if (isUnmountedRef.current || createRequestId !== createRequestIdRef.current) {
         await window.electronAPI.terminal.destroy(ptyId).catch(() => {});
         return;
+      }
+
+      const windowsPtyOptions = buildWindowsPtyCompatibilityOptions({
+        platform: window.electronAPI.env.platform,
+        osRelease: window.electronAPI.env.osRelease,
+        backend: windowsPtyBackend,
+        conptySource: windowsConptySource,
+      });
+      if (windowsPtyOptions.windowsPty) {
+        terminal.options.windowsPty = windowsPtyOptions.windowsPty;
       }
 
       ptyIdRef.current = ptyId;
@@ -676,10 +706,25 @@ export function useXterm({
       });
       exitCleanupRef.current = exitCleanup;
 
+      try {
+        await window.electronAPI.terminal.activate(ptyId);
+      } catch (error) {
+        cleanup();
+        exitCleanup();
+        cleanupRef.current = null;
+        exitCleanupRef.current = null;
+        ptyIdRef.current = null;
+        await window.electronAPI.terminal.destroy(ptyId).catch(() => {});
+        throw error;
+      }
+
       // Handle input
       terminal.onData((data) => {
-        if (ptyIdRef.current) {
-          window.electronAPI.terminal.write(ptyIdRef.current, data);
+        const ptyInput = filterTerminalColorQueryResponses
+          ? stripTerminalColorQueryResponses(data)
+          : data;
+        if (ptyIdRef.current && ptyInput.length > 0) {
+          window.electronAPI.terminal.write(ptyIdRef.current, ptyInput);
         }
       });
 
@@ -693,7 +738,15 @@ export function useXterm({
       terminal.writeln(`\x1b[31mFailed to start terminal.\x1b[0m`);
       terminal.writeln(`\x1b[33mError: ${error}\x1b[0m`);
     }
-  }, [cwd, command, shellConfig, commandKey, terminalRenderer]);
+  }, [
+    cwd,
+    command,
+    shellConfig,
+    commandKey,
+    terminalRenderer,
+    useWindowsConptyCompatibility,
+    filterTerminalColorQueryResponses,
+  ]);
 
   useEffect(() => {
     const shouldActivate = isActive || initialCommandRef.current;

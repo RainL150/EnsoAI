@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { FileCode } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { panelTransition } from '@/App/constants';
 import { normalizePath } from '@/App/storage';
 import { GlobalSearchDialog, type SearchMode } from '@/components/search';
@@ -14,8 +14,10 @@ import {
 import { addToast, toastManager } from '@/components/ui/toast';
 import { useEditor } from '@/hooks/useEditor';
 import { useFileTree } from '@/hooks/useFileTree';
+import { useFileChanges } from '@/hooks/useSourceControl';
 import { useI18n } from '@/i18n';
 import { isFocusLocked, pauseFocusLock, restoreFocus } from '@/lib/focusLock';
+import { useSettingsStore } from '@/stores/settings';
 import { useTerminalWriteStore } from '@/stores/terminalWrite';
 import { getEditorSelectionText } from './EditorArea';
 import {
@@ -24,11 +26,11 @@ import {
   FileConflictDialog,
 } from './FileConflictDialog';
 import { FileTree } from './FileTree';
+import { buildFileTreeGitDecorations } from './fileTreeGitDecorations';
 import { NewItemDialog } from './NewItemDialog';
 
 interface FileSidebarProps {
   rootPath: string | undefined;
-  isActive?: boolean;
   sessionId?: string | null;
   width: number;
   collapsed: boolean;
@@ -41,7 +43,6 @@ type NewItemType = 'file' | 'directory' | null;
 
 export function FileSidebar({
   rootPath,
-  isActive = false,
   sessionId,
   width,
   collapsed,
@@ -50,6 +51,7 @@ export function FileSidebar({
   onSwitchTab,
 }: FileSidebarProps) {
   const { t } = useI18n();
+  const sidebarActive = !collapsed;
   const {
     tree,
     isLoading,
@@ -63,7 +65,19 @@ export function FileSidebar({
     handleExternalDrop,
     resolveConflictsAndContinue,
     revealFile,
-  } = useFileTree({ rootPath, enabled: !!rootPath, isActive });
+  } = useFileTree({ rootPath, enabled: !!rootPath, isActive: sidebarActive });
+  const { data: fileChangesResult } = useFileChanges(rootPath ?? null, sidebarActive);
+  const gitDecorations = useMemo(
+    () =>
+      rootPath
+        ? buildFileTreeGitDecorations(
+            rootPath,
+            fileChangesResult?.changes ?? [],
+            window.electronAPI.env.platform
+          )
+        : undefined,
+    [fileChangesResult?.changes, rootPath]
+  );
 
   const { tabs, activeTab, loadFile, closeFile, setActiveFile, navigateToFile } = useEditor();
 
@@ -84,11 +98,16 @@ export function FileSidebar({
   const newItemPausedSessionIdRef = useRef<string | null>(null);
 
   // Auto-sync file tree selection with active tab
+  const fileTreeAutoReveal = useSettingsStore((s) => s.fileTreeAutoReveal);
+
   useEffect(() => {
     if (!activeTab?.path || !rootPath) return;
     setSelectedFilePath(activeTab.path);
-    revealFile(activeTab.path);
-  }, [activeTab?.path, rootPath, revealFile]);
+    // Expand parent directories to reveal the file (only if enabled)
+    if (fileTreeAutoReveal) {
+      revealFile(activeTab.path);
+    }
+  }, [activeTab?.path, rootPath, revealFile, fileTreeAutoReveal]);
 
   const handleRecordOperations = useCallback((addFn: (operations: any[]) => void) => {
     addOperationsRef.current = addFn;
@@ -436,6 +455,7 @@ export function FileSidebar({
         >
           <FileTree
             tree={tree}
+            gitDecorations={gitDecorations}
             expandedPaths={expandedPaths}
             onToggleExpand={toggleExpand}
             onFileClick={handleFileClick}

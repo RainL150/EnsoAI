@@ -1,7 +1,8 @@
-import type { ClaudeProvider } from '@shared/types';
+import type { ClaudeProvider, CodexRuntime } from '@shared/types';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Ban,
+  BookOpen,
   Check,
   CheckCircle,
   Circle,
@@ -23,6 +24,7 @@ import {
   isClaudeProviderMatch,
   markClaudeProviderSwitch,
 } from '@/lib/claudeProvider';
+import type { CodexNativeShell } from '@/lib/codexWslCommand';
 import { cn } from '@/lib/utils';
 import { useSettingsStore } from '@/stores/settings';
 
@@ -32,6 +34,10 @@ const EDGE_THRESHOLD = 20; // pixels from edge
 export interface Session {
   id: string; // Session's own unique ID
   sessionId?: string; // Optional Claude session ID for --session-id/--resume (defaults to id if not set)
+  cliSessionId?: string; // Real CLI session id, used by Codex resume and history lookup
+  codexRuntime?: CodexRuntime; // Codex 实际运行环境，决定历史会话目录。
+  codexWslDistro?: string; // WSL Codex 所在发行版，重启后仍能定位到原会话。
+  codexNativeShell?: CodexNativeShell; // 原生 Codex 创建时实际使用的 shell，恢复时不跟随全局设置变化。
   name: string;
   agentId: string; // which agent CLI to use (e.g., 'claude', 'codex', 'gemini', 'claude-hapi', 'claude-happy')
   agentCommand: string; // the CLI command to run (e.g., 'claude', 'codex')
@@ -57,6 +63,7 @@ interface SessionBarProps {
   onNewSessionWithAgent?: (agentId: string, agentCommand: string) => void;
   onRenameSession: (id: string, name: string) => void;
   onReorderSessions?: (fromIndex: number, toIndex: number) => void;
+  onOpenCodexHistory?: (session: Session) => void;
   // Quick Terminal props
   quickTerminalOpen?: boolean;
   quickTerminalHasProcess?: boolean;
@@ -88,6 +95,7 @@ const AGENT_INFO: Record<string, { name: string; command: string }> = {
   cursor: { name: 'Cursor', command: 'cursor-agent' },
   opencode: { name: 'OpenCode', command: 'opencode' },
   pi: { name: 'Pi', command: 'pi' },
+  omp: { name: 'OMP', command: 'omp' },
 };
 
 // Session tab with glow effect
@@ -459,6 +467,7 @@ export function SessionBar({
   onNewSessionWithAgent,
   onRenameSession,
   onReorderSessions,
+  onOpenCodexHistory,
   quickTerminalOpen,
   quickTerminalHasProcess,
   onToggleQuickTerminal,
@@ -475,6 +484,15 @@ export function SessionBar({
   const [showProviderMenu, setShowProviderMenu] = useState(false);
   const [installedAgents, setInstalledAgents] = useState<Set<string>>(new Set());
   const dragStart = useRef({ x: 0, y: 0, startX: 0, startY: 0 });
+  const activeSession = sessions.find((session) => session.id === activeSessionId);
+  const codexSessionHistoryButtonEnabled = useSettingsStore(
+    (s) => s.codexSessionHistoryButtonEnabled
+  );
+  const showCodexHistoryButton =
+    codexSessionHistoryButtonEnabled &&
+    !state.collapsed &&
+    activeSession?.agentCommand === 'codex' &&
+    onOpenCodexHistory;
 
   // Provider 查询和切换逻辑
   const queryClient = useQueryClient();
@@ -1059,6 +1077,27 @@ export function SessionBar({
                     </div>
                   )}
                 </div>
+              </>
+            )}
+
+            {showCodexHistoryButton && (
+              <>
+                <div className="mx-1 h-4 w-px bg-border" />
+                <Tooltip>
+                  <TooltipTrigger render={<span />}>
+                    <button
+                      type="button"
+                      onClick={() => activeSession && onOpenCodexHistory?.(activeSession)}
+                      className={cn(
+                        'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-colors',
+                        'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+                      )}
+                    >
+                      <BookOpen className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipPopup>{t('Codex session history')}</TooltipPopup>
+                </Tooltip>
               </>
             )}
 

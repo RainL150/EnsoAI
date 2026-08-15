@@ -39,6 +39,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from '@/components/ui/menu';
 import { addToast } from '@/components/ui/toast';
 import { useDebouncedSave } from '@/hooks/useDebouncedSave';
 import { useI18n } from '@/i18n';
+import { buildFileBreadcrumbSegments } from '@/lib/fileTreePaths';
 import { toMonacoFileUri } from '@/lib/monacoModelPath';
 import { useActiveSessionId } from '@/stores/agentSessions';
 import type { EditorTab, NavEntry, PendingCursor } from '@/stores/editor';
@@ -379,23 +380,10 @@ export const EditorArea = forwardRef<EditorAreaRef, EditorAreaProps>(function Ed
     [onSave, activeTabPath, refreshBlame]
   );
 
-  // Calculate breadcrumb segments from active file path
-  const breadcrumbSegments = useMemo(() => {
-    if (!activeTabPath || !rootPath) return [];
-
-    const relativePath = activeTabPath.startsWith(rootPath)
-      ? activeTabPath.slice(rootPath.length).replace(/^\//, '')
-      : activeTabPath;
-
-    if (!relativePath) return [];
-
-    const parts = relativePath.split('/');
-    return parts.map((name, index) => ({
-      name,
-      path: `${rootPath}/${parts.slice(0, index + 1).join('/')}`,
-      isLast: index === parts.length - 1,
-    }));
-  }, [activeTabPath, rootPath]);
+  const breadcrumbSegments = useMemo(
+    () => buildFileBreadcrumbSegments(activeTabPath, rootPath, window.electronAPI.env.platform),
+    [activeTabPath, rootPath]
+  );
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -620,13 +608,18 @@ export const EditorArea = forwardRef<EditorAreaRef, EditorAreaProps>(function Ed
       // Cmd/Ctrl+S shortcut is registered via useEffect + onKeyDown below
       // to avoid addCommand's closure stale issue and registry leak problem
 
-      editor.addCommand(m.KeyMod.CtrlCmd | m.KeyMod.Shift | m.KeyCode.KeyF, () => {
-        const selection = editor.getSelection();
-        const selectedText =
-          !selection || selection.isEmpty()
-            ? ''
-            : (editor.getModel()?.getValueInRange(selection) ?? '');
-        onGlobalSearch?.(selectedText);
+      const searchDisposable = editor.onKeyDown((e) => {
+        const isCmd = e.metaKey || e.ctrlKey;
+        if (isCmd && e.shiftKey && e.keyCode === m.KeyCode.KeyF) {
+          e.preventDefault();
+          e.stopPropagation();
+          const selection = editor.getSelection();
+          const selectedText =
+            !selection || selection.isEmpty()
+              ? ''
+              : (editor.getModel()?.getValueInRange(selection) ?? '');
+          onGlobalSearch?.(selectedText);
+        }
       });
 
       // Add context menu action: Send to session
@@ -668,12 +661,10 @@ export const EditorArea = forwardRef<EditorAreaRef, EditorAreaProps>(function Ed
         },
       });
 
-      // Double-click: select innermost scope (brackets, quotes, indentation)
+      editor.onDidDispose(() => searchDisposable.dispose());
+
       setupDoubleClickScope(editor);
 
-      // Cmd/Ctrl+Click and F12: go-to-definition via ripgrep declaration search.
-      // Dispose the previous instance first to avoid accumulating listeners across
-      // file switches (editor is remounted with a new instance on every key change).
       definitionNavDisposableRef.current?.dispose();
       definitionNavDisposableRef.current = setupDefinitionNavigation(
         editor,

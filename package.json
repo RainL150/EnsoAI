@@ -1,6 +1,6 @@
 {
   "name": "enso-ai",
-  "version": "0.2.42",
+  "version": "0.2.45",
   "description": "EnsoAI - Git Worktree Manager with AI Agent",
   "main": "./out/main/index.js",
   "author": {
@@ -15,11 +15,11 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "start": "electron-vite preview",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps && node scripts/prepare-node-pty-conpty.mjs",
     "build:mac": "pnpm build && electron-builder --mac",
     "build:mac:unsigned": "pnpm build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac -c.mac.identity=null -c.mac.notarize=false",
     "build:mac:debug": "pnpm build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --dir  -c.mac.identity=null -c.mac.notarize=false",
-    "build:win": "pnpm build && electron-builder --win",
+    "build:win": "pnpm build && node scripts/prepare-node-pty-conpty.mjs && electron-builder --win",
     "build:linux": "pnpm build && electron-builder --linux",
     "generate:themes": "npx tsx scripts/generate-themes.ts",
     "test": "vitest run",
@@ -84,6 +84,8 @@
   "devDependencies": {
     "@biomejs/biome": "^2.3.10",
     "@electron-toolkit/tsconfig": "^2.0.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^25.0.3",
     "@types/pidusage": "^2.0.5",
     "@types/react": "^19.2.7",
@@ -96,6 +98,7 @@
     "electron-builder": "^26.4.0",
     "electron-vite": "^5.0.0",
     "husky": "^9.1.7",
+    "jsdom": "^29.1.1",
     "lint-staged": "^16.2.7",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",

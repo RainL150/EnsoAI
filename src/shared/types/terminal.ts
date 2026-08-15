@@ -4,6 +4,15 @@ export interface TerminalSession {
   cwd: string;
 }
 
+export type WindowsPtyBackend = 'conpty' | 'winpty';
+export type WindowsConptySource = 'bundled' | 'system';
+
+export interface TerminalCreateResult {
+  id: string;
+  windowsPtyBackend?: WindowsPtyBackend;
+  windowsConptySource?: WindowsConptySource;
+}
+
 export interface TerminalCreateOptions {
   cwd?: string;
   shell?: string;
@@ -12,6 +21,8 @@ export interface TerminalCreateOptions {
   rows?: number;
   env?: Record<string, string>;
   shellConfig?: import('./shell').ShellConfig;
+  /** Windows 滚屏补丁：使用随包新版 ConPTY/OpenConsole 改善旧系统滚动异常。 */
+  windowsConptyCompatibilityFixEnabled?: boolean;
   /** Command to execute after shell is ready */
   initialCommand?: string;
 }

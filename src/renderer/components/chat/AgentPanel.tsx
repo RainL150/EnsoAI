@@ -1,4 +1,3 @@
-import type { AIProvider } from '@shared/types';
 import { Plus, Settings, Sparkles } from 'lucide-react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TEMP_REPO_ID } from '@/App/constants';
@@ -14,6 +13,7 @@ import {
 } from '@/components/ui/empty';
 import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
 import { useI18n } from '@/i18n';
+import { findAgentSessionById } from '@/lib/agentSessionMatch';
 import { pauseFocusLock, restoreFocusIfLocked } from '@/lib/focusLock';
 import { defaultDarkTheme, getXtermTheme } from '@/lib/ghosttyTheme';
 import { matchesKeybinding } from '@/lib/keybinding';
@@ -27,6 +27,8 @@ import { useTerminalStore } from '@/stores/terminal';
 import { useWorktreeActivityStore } from '@/stores/worktreeActivity';
 import { AgentGroup } from './AgentGroup';
 import { AgentTerminal } from './AgentTerminal';
+import { CodexHistoryPanel } from './CodexHistoryPanel';
+import { CodexSessionPickerDialog, type CodexSessionSelection } from './CodexSessionPickerDialog';
 import { EnhancedInputContainer } from './EnhancedInputContainer';
 import { QuickTerminalModal } from './QuickTerminalModal';
 import type { Session } from './SessionBar';
@@ -51,6 +53,7 @@ const AGENT_INFO: Record<string, { name: string; command: string }> = {
   cursor: { name: 'Cursor', command: 'cursor-agent' },
   opencode: { name: 'OpenCode', command: 'opencode' },
   pi: { name: 'Pi', command: 'pi' },
+  omp: { name: 'OMP', command: 'omp' },
 };
 
 /**
@@ -297,6 +300,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
   const addSession = useAgentSessionsStore((state) => state.addSession);
   const removeSession = useAgentSessionsStore((state) => state.removeSession);
   const updateSession = useAgentSessionsStore((state) => state.updateSession);
+  const claimCliSessionId = useAgentSessionsStore((state) => state.claimCliSessionId);
   const setActiveId = useAgentSessionsStore((state) => state.setActiveId);
 
   // Agent tasks store for clearing task data on session close
@@ -468,6 +472,17 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
   // Empty state agent menu
   const [showAgentMenu, setShowAgentMenu] = useState(false);
   const [installedAgents, setInstalledAgents] = useState<Set<string>>(new Set());
+  const [historySessionId, setHistorySessionId] = useState<string | undefined>();
+  const [historySessionWslDistro, setHistorySessionWslDistro] = useState<string | undefined>();
+  const [historyPickerSession, setHistoryPickerSession] = useState<Session | null>(null);
+  const [historySourceSessionId, setHistorySourceSessionId] = useState<string | undefined>();
+  const historySourceSession = useMemo(
+    () =>
+      historySourceSessionId
+        ? (allSessions.find((session) => session.id === historySourceSessionId) ?? null)
+        : null,
+    [allSessions, historySourceSessionId]
+  );
 
   // Build installed agents set from persisted detection status
   useEffect(() => {
@@ -537,15 +552,9 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
   );
   const clearContinueRequest = useCodeReviewContinueStore((s) => s.clearContinueRequest);
 
-  // Map AI provider (code review) to agent id for "Continue Conversation"
+  // Only Claude/Cursor can currently reach the code-review continue path.
   const continueAgentId = useMemo(() => {
-    const map: Record<AIProvider, string> = {
-      'claude-code': 'claude',
-      'codex-cli': 'codex',
-      'cursor-cli': 'cursor',
-      'gemini-cli': 'gemini',
-    };
-    return pendingContinueProvider != null ? (map[pendingContinueProvider] ?? 'claude') : 'claude';
+    return pendingContinueProvider === 'cursor-cli' ? 'cursor' : 'claude';
   }, [pendingContinueProvider]);
 
   useEffect(() => {
@@ -784,8 +793,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
 
   // Notification payload may carry either UI session id or Claude sessionId.
   const findSessionByNotificationId = useCallback(
-    (incomingSessionId: string) =>
-      allSessions.find((s) => s.id === incomingSessionId || s.sessionId === incomingSessionId),
+    (incomingSessionId: string) => findAgentSessionById(allSessions, incomingSessionId),
     [allSessions]
   );
 
@@ -841,7 +849,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
         // Auto popup enhanced input if enabled
         // Now we set the open state in store - it persists per session
         if (shouldAutoPopup) {
-          setEnhancedInputOpen(sessionId, true);
+          setEnhancedInputOpen(session.id, true);
         }
 
         // Send system notification
@@ -1467,6 +1475,65 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
     return max;
   }, [statusLineHeightsByGroupId]);
 
+  const handleOpenCodexHistory = useCallback((session: Session) => {
+    setHistorySourceSessionId(session.id);
+    setHistorySessionWslDistro(session.codexWslDistro);
+
+    if (session.cliSessionId) {
+      setHistoryPickerSession(null);
+      setHistorySessionId(session.cliSessionId);
+      return;
+    }
+
+    setHistorySessionId(undefined);
+    setHistoryPickerSession(session);
+  }, []);
+
+  const handleSelectCodexHistorySession = useCallback(
+    (selection: CodexSessionSelection) => {
+      const sourceSession = historyPickerSession ?? historySourceSession;
+
+      if (sourceSession) {
+        setHistorySourceSessionId(sourceSession.id);
+      }
+      setHistoryPickerSession(null);
+      setHistorySessionId(selection.sessionId);
+      setHistorySessionWslDistro(selection.wslDistro);
+    },
+    [historyPickerSession, historySourceSession]
+  );
+
+  const handleBackToCodexSessionList = useCallback(() => {
+    if (!historySourceSession) return;
+
+    setHistorySessionId(undefined);
+    setHistorySessionWslDistro(historySourceSession.codexWslDistro);
+    setHistoryPickerSession(historySourceSession);
+  }, [historySourceSession]);
+
+  const handleBackToCurrentCodexSession = useCallback(() => {
+    if (!historySourceSession?.cliSessionId) return;
+
+    setHistoryPickerSession(null);
+    setHistorySessionId(historySourceSession.cliSessionId);
+    setHistorySessionWslDistro(historySourceSession.codexWslDistro);
+  }, [historySourceSession]);
+
+  const handleBindCodexHistorySession = useCallback(() => {
+    if (!historySourceSession || !historySessionId) return;
+    if (!claimCliSessionId(historySourceSession.id, historySessionId)) return;
+    updateSession(historySourceSession.id, {
+      codexRuntime: historySessionWslDistro ? 'wsl' : historySourceSession.codexRuntime,
+      codexWslDistro: historySessionWslDistro,
+    });
+  }, [
+    claimCliSessionId,
+    historySessionId,
+    historySessionWslDistro,
+    historySourceSession,
+    updateSession,
+  ]);
+
   if (!cwd) return null;
 
   // Check if current worktree has any groups (used for empty state detection)
@@ -1697,6 +1764,10 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
                 id={session.id}
                 cwd={session.cwd}
                 sessionId={session.sessionId || session.id}
+                cliSessionId={session.cliSessionId}
+                codexRuntime={session.codexRuntime}
+                codexWslDistro={session.codexWslDistro}
+                codexNativeShell={session.codexNativeShell}
                 agentId={session.agentId}
                 agentCommand={session.agentCommand || 'claude'}
                 customPath={session.customPath}
@@ -1709,6 +1780,23 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
                 initialPrompt={session.pendingCommand}
                 onInitialized={() => handleInitialized(sessionId)}
                 onActivated={() => handleActivated(sessionId)}
+                onCodexRuntimeDetected={(runtime, nativeShell) => {
+                  updateSession(sessionId, {
+                    codexRuntime: runtime,
+                    ...(nativeShell ? { codexNativeShell: nativeShell } : {}),
+                  });
+                }}
+                onCliSessionIdDetected={(cliSessionId, runtime, wslDistro) => {
+                  const claimed = claimCliSessionId(sessionId, cliSessionId);
+                  if (claimed) {
+                    // 会话号与运行环境同时保存，后续历史查询才能回到同一 WSL 目录。
+                    updateSession(sessionId, {
+                      codexRuntime: runtime,
+                      ...(wslDistro ? { codexWslDistro: wslDistro } : {}),
+                    });
+                  }
+                  return claimed;
+                }}
                 onActivatedWithFirstLine={(line) => handleActivatedWithFirstLine(sessionId, line)}
                 onExit={() => handleCloseSession(sessionId, groupId || undefined)}
                 onTerminalTitleChange={(title) => {
@@ -1779,6 +1867,7 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
               }
               onSessionRename={handleRenameSession}
               onSessionReorder={(from, to) => handleReorderSessions(group.id, from, to)}
+              onOpenCodexHistory={handleOpenCodexHistory}
               onGroupClick={() => handleGroupClick(group.id)}
               quickTerminalOpen={quickTerminalOpen}
               quickTerminalHasProcess={hasRunningProcess}
@@ -1813,6 +1902,37 @@ export function AgentPanel({ repoPath, cwd, isActive = false, onSwitchWorktree }
           onSessionInit={handleQuickTerminalSessionInit}
         />
       )}
+      <CodexHistoryPanel
+        sessionId={historySessionId}
+        currentSessionId={historySourceSession?.cliSessionId}
+        cwd={historySourceSession?.cwd}
+        runtime={historySourceSession?.codexRuntime}
+        wslDistro={historySessionWslDistro ?? historySourceSession?.codexWslDistro}
+        open={!!historySessionId}
+        onBindToCurrentSession={historySourceSession ? handleBindCodexHistorySession : undefined}
+        onBackToCurrentSession={
+          historySourceSession?.cliSessionId ? handleBackToCurrentCodexSession : undefined
+        }
+        onBackToSessionList={historySourceSession ? handleBackToCodexSessionList : undefined}
+        onOpenChange={(open) => {
+          if (!open) {
+            setHistorySessionId(undefined);
+            setHistorySessionWslDistro(undefined);
+            setHistorySourceSessionId(undefined);
+          }
+        }}
+      />
+      <CodexSessionPickerDialog
+        open={historyPickerSession != null}
+        cwd={historyPickerSession?.cwd}
+        runtime={historyPickerSession?.codexRuntime}
+        wslDistro={historyPickerSession?.codexWslDistro}
+        initialSessionId={historyPickerSession?.cliSessionId}
+        onOpenChange={(open) => {
+          if (!open) setHistoryPickerSession(null);
+        }}
+        onSelectSession={handleSelectCodexHistorySession}
+      />
     </div>
   );
 }

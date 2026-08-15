@@ -308,6 +308,8 @@ export interface SettingsState {
   terminalRenderer: TerminalRenderer;
   terminalScrollback: number;
   terminalOptionIsMeta: boolean;
+  windowsConptyCompatibilityFixEnabled: boolean;
+  codexSessionHistoryButtonEnabled: boolean;
   copyOnSelection: boolean;
 
   // Keybindings
@@ -424,6 +426,8 @@ export interface SettingsState {
   setTerminalRenderer: (renderer: TerminalRenderer) => void;
   setTerminalScrollback: (scrollback: number) => void;
   setTerminalOptionIsMeta: (enabled: boolean) => void;
+  setWindowsConptyCompatibilityFixEnabled: (enabled: boolean) => void;
+  setCodexSessionHistoryButtonEnabled: (enabled: boolean) => void;
   setCopyOnSelection: (enabled: boolean) => void;
 
   // Setters - Keybindings
@@ -571,4 +575,5 @@ export const BUILTIN_AGENT_IDS: BuiltinAgentId[] = [
   'cursor',
   'opencode',
   'pi',
+  'omp',
 ];
